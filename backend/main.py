@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -31,7 +31,7 @@ async def upload(
     upload_root = Path("uploads")
     upload_root.mkdir(parents=True, exist_ok=True)
 
-    timestamp = datetime.utcnow().strftime("%Y%m%d%H%M%S")
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")
     type_ii_path = upload_root / f"type-ii-{timestamp}-{type_ii_report.filename}"
     management_path = upload_root / f"management-review-{timestamp}-{management_review.filename}"
 

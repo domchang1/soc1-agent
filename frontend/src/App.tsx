@@ -15,7 +15,7 @@ export default function App() {
   const [progress, setProgress] = useState(0);
   const [status, setStatus] = useState("Awaiting files.");
   const [error, setError] = useState<string | null>(null);
-  const [output, setOutput] = useState<string>("Upload files to begin.");
+  const [output, setOutput] = useState<string>("");
   const [isUploading, setIsUploading] = useState(false);
 
   const canSubmit = useMemo(
@@ -90,7 +90,7 @@ export default function App() {
         </p>
       </section>
 
-      <section className="card">
+      <section className="card upload-card">
         <div className="form-grid">
           <div>
             <label htmlFor="type-ii">Type II report (PDF or DOCX)</label>
@@ -126,7 +126,9 @@ export default function App() {
 
       <section className="card">
         <h3>Output</h3>
-        <div className="output">{output}</div>
+        <div className={`output ${output ? "" : "output-empty"}`}>
+          {output || "Upload files to begin."}
+        </div>
       </section>
     </div>
   );
