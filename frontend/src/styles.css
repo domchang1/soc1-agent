@@ -1,0 +1,119 @@
+:root {
+  font-family: "Inter", system-ui, sans-serif;
+  color: #0f172a;
+  background: #f8fafc;
+}
+
+body {
+  margin: 0;
+  min-height: 100vh;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+.page {
+  max-width: 960px;
+  margin: 0 auto;
+  padding: 48px 24px 80px;
+}
+
+.hero {
+  margin-bottom: 32px;
+}
+
+.hero h1 {
+  font-size: 2.4rem;
+  margin: 0 0 12px;
+}
+
+.hero p {
+  margin: 0;
+  color: #475569;
+  font-size: 1.05rem;
+  line-height: 1.5;
+}
+
+.card {
+  background: #ffffff;
+  border-radius: 16px;
+  padding: 24px;
+  box-shadow: 0 20px 40px rgba(15, 23, 42, 0.08);
+  border: 1px solid #e2e8f0;
+  margin-bottom: 24px;
+}
+
+.form-grid {
+  display: grid;
+  gap: 16px;
+}
+
+label {
+  font-weight: 600;
+  color: #1e293b;
+}
+
+input[type="file"] {
+  width: 100%;
+  padding: 12px;
+  border: 1px solid #cbd5f5;
+  border-radius: 10px;
+  background: #f8fafc;
+}
+
+button {
+  padding: 12px 18px;
+  border: none;
+  border-radius: 999px;
+  background: #2563eb;
+  color: white;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+button:disabled {
+  background: #94a3b8;
+  cursor: not-allowed;
+}
+
+.progress-wrap {
+  display: grid;
+  gap: 8px;
+}
+
+.progress-bar {
+  height: 10px;
+  width: 100%;
+  background: #e2e8f0;
+  border-radius: 999px;
+  overflow: hidden;
+}
+
+.progress-value {
+  height: 100%;
+  background: #22c55e;
+  width: 0%;
+  transition: width 0.2s ease;
+}
+
+.output {
+  white-space: pre-wrap;
+  background: #0f172a;
+  color: #e2e8f0;
+  padding: 16px;
+  border-radius: 12px;
+  font-family: "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace;
+  font-size: 0.9rem;
+  min-height: 140px;
+}
+
+.status {
+  color: #0f172a;
+  font-weight: 500;
+}
+
+.error {
+  color: #b91c1c;
+  font-weight: 600;
+}

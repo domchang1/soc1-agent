@@ -1,0 +1,32 @@
+.DS_Store
+.env
+.env.*
+*.log
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+env/
+ENV/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+pip-wheel-metadata/
+*.egg-info/
+dist/
+build/
+
+# FastAPI / uploads
+uploads/
+
+# Node / Vite
+node_modules/
+dist/
+.vite/
+
+# IDE
+.vscode/
+.idea/
