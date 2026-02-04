@@ -97,11 +97,64 @@ button {
   color: white;
   font-weight: 600;
   cursor: pointer;
+  transition: transform 0.15s ease, box-shadow 0.2s ease, background 0.2s ease;
+}
+
+button:hover:not(:disabled) {
+  transform: translateY(-1px);
+  box-shadow: 0 8px 20px rgba(37, 99, 235, 0.25);
 }
 
 button:disabled {
   background: #94a3b8;
   cursor: not-allowed;
+}
+
+button.secondary {
+  background: #64748b;
+}
+
+button.secondary:hover:not(:disabled) {
+  background: #475569;
+  box-shadow: 0 8px 20px rgba(71, 85, 105, 0.25);
+}
+
+.button-group {
+  display: flex;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+.output-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 12px;
+}
+
+.output-header h3 {
+  margin: 0;
+}
+
+.download-btn {
+  background: #059669;
+  padding: 10px 20px;
+  font-size: 0.9rem;
+}
+
+.download-btn:hover:not(:disabled) {
+  background: #047857;
+  box-shadow: 0 8px 20px rgba(5, 150, 105, 0.3);
+}
+
+input[type="file"]:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+
+input[type="file"]:disabled::file-selector-button {
+  cursor: not-allowed;
+  opacity: 0.7;
 }
 
 .progress-wrap {
@@ -122,6 +175,28 @@ button:disabled {
   background: #22c55e;
   width: 0%;
   transition: width 0.2s ease;
+}
+
+.progress-value.progress-animated {
+  background: linear-gradient(
+    90deg,
+    #22c55e 0%,
+    #4ade80 25%,
+    #22c55e 50%,
+    #4ade80 75%,
+    #22c55e 100%
+  );
+  background-size: 200% 100%;
+  animation: shimmer 1.5s ease-in-out infinite;
+}
+
+@keyframes shimmer {
+  0% {
+    background-position: 200% 0;
+  }
+  100% {
+    background-position: -200% 0;
+  }
 }
 
 .output {
