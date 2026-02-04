@@ -56,7 +56,7 @@ export default function App() {
             "",
             "The AI agent is:",
             "• Extracting text and tables from the PDF",
-            "• Analyzing the SOC1 Type II report content",
+            "• Analyzing the SOC1 Management Review report content",
             "• Mapping controls to the Excel template",
             "",
             "This may take 1-2 minutes depending on document size.",
@@ -243,9 +243,9 @@ export default function App() {
   return (
     <div className="page">
       <section className="hero">
-        <h1>SOC 1 Type II Generator</h1>
+        <h1>SOC-1 Management Review Generator</h1>
         <p>
-          Upload a Type II report (PDF) and the blank SOC 1 Management Review worksheet (Excel)
+          Upload a Type II report (PDF) and the blank SOC-1 Management Review worksheet (Excel)
           to generate a filled management review. AI-powered extraction maps controls,
           test results, and findings automatically.
         </p>
@@ -275,7 +275,7 @@ export default function App() {
           </div>
           <div className="button-group">
             <button type="button" onClick={handleUpload} disabled={!canSubmit}>
-              {isUploading ? "Uploading..." : isProcessing ? "Processing..." : "Generate SOC 1"}
+              {isUploading ? "Uploading..." : isProcessing ? "Processing..." : "Generate SOC-1"}
             </button>
             {(canDownload || jobId) && (
               <button
