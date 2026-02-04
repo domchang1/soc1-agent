@@ -1,11 +1,11 @@
 # SOC 1 Type II Management Review Generator
 
-AI-powered agent for processing SOC1 Type II audit reports and automatically filling management review Excel templates.
+AI-powered tool for processing SOC1 Type II audit reports and automatically filling management review Excel templates.
 
 ## Features
 
 - **PDF Extraction**: Uses `pdfplumber` to extract text and tables from SOC1 Type II PDF reports
-- **AI-Powered Mapping**: Supports multiple AI providers (Google Gemini free tier, Anthropic Claude)
+- **AI-Powered Mapping**: Uses Google Gemini AI (free tier) to intelligently map extracted content to Excel template fields
 - **Excel Generation**: Automatically fills management review templates with extracted data
 - **Gap Analysis**: Analyzes the extraction for completeness and provides recommendations
 
@@ -13,7 +13,7 @@ AI-powered agent for processing SOC1 Type II audit reports and automatically fil
 
 - Python 3.10+
 - Node.js 18+
-- AI API key: **Google Gemini** (free tier)
+- Google API key (free) - Get at https://aistudio.google.com/apikey
 
 ## Setup
 
@@ -25,7 +25,7 @@ python -m venv .venv
 source .venv/bin/activate  # On Windows: .venv\Scripts\activate
 pip install -r requirements.txt
 
-# Set your AI API key (choose one):
+# Set your Google API key (free)
 export GOOGLE_API_KEY="your-google-api-key"
 
 # Run the server
@@ -68,8 +68,8 @@ Open `http://localhost:5173` to use the UI.
 
 ```
 ┌─────────────────┐     ┌─────────────────┐     ┌─────────────────┐
-│   Frontend      │────▶│   FastAPI       │────▶│   Agent         │
-│   (React)       │     │   Backend       │     │   (Claude AI)   │
+│   Frontend      │────▶│   FastAPI       │────▶│   Gemini AI     │
+│   (React)       │     │   Backend       │     │   (Free Tier)   │
 └─────────────────┘     └─────────────────┘     └─────────────────┘
                                │                        │
                                ▼                        ▼
@@ -86,12 +86,20 @@ Open `http://localhost:5173` to use the UI.
 - `uvicorn` - ASGI server
 - `pdfplumber` - PDF text and table extraction
 - `openpyxl` - Excel file manipulation
-- `anthropic` - Claude AI API client
+- `google-generativeai` - Google Gemini AI client
 
 ### Frontend
 - React 18
 - TypeScript
 - Vite
+
+## Environment Variables
+
+| Variable | Description | Required |
+|----------|-------------|----------|
+| `GOOGLE_API_KEY` | Google AI API key (free tier available) | Yes |
+
+Get your free API key at: https://aistudio.google.com/apikey
 
 ## Programmatic Usage
 
@@ -100,19 +108,10 @@ You can also use the agent directly in Python:
 ```python
 from agent import process_soc1_sync
 
-# Auto-detect provider based on available API keys
 result = process_soc1_sync(
     type_ii_path="path/to/soc1-report.pdf",
     management_review_path="path/to/template.xlsx",
     output_dir="path/to/output",
-)
-
-# Or specify a provider explicitly
-result = process_soc1_sync(
-    type_ii_path="path/to/soc1-report.pdf",
-    management_review_path="path/to/template.xlsx",
-    output_dir="path/to/output",
-    provider="gemini",  # or "anthropic"
 )
 
 print(f"Filled template saved to: {result['output_path']}")

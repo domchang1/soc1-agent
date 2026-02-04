@@ -4,12 +4,8 @@ SOC1 Type II Report Processing Agent
 This module provides functionality to:
 1. Extract text and tables from PDF Type II reports
 2. Read Excel management review templates
-3. Use AI to intelligently map PDF content to Excel fields
+3. Use Google Gemini AI to intelligently map PDF content to Excel fields
 4. Return a filled-out Excel management review
-
-Supports multiple AI providers:
-- Google Gemini (free tier available)
-- Anthropic Claude
 """
 
 from __future__ import annotations
@@ -17,20 +13,20 @@ from __future__ import annotations
 import json
 import os
 import re
-from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from enum import Enum
 from pathlib import Path
 from typing import Any
 
+import google.generativeai as genai
 import openpyxl
 import pdfplumber
+from dotenv import load_dotenv
 
+load_dotenv()
 
-class AIProvider(Enum):
-    """Supported AI providers."""
-    GEMINI = "gemini"
-    ANTHROPIC = "anthropic"
+GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
+if not GOOGLE_API_KEY:
+    raise ValueError("GOOGLE_API_KEY not found in environment variables. Please set it in .env file.")
 
 
 @dataclass
@@ -237,21 +233,21 @@ class ExcelHandler:
         return output_path
 
 
-class BaseAIClient(ABC):
-    """Abstract base class for AI clients."""
+class SOC1Agent:
+    """
+    AI-powered agent for processing SOC1 Type II reports.
 
-    @abstractmethod
-    def generate(self, prompt: str, max_tokens: int = 8192) -> str:
-        """Generate a response from the AI model."""
-        pass
-
-
-class GeminiClient(BaseAIClient):
-    """Google Gemini AI client (free tier available)."""
+    Uses Google Gemini (free tier available) for intelligent content extraction.
+    """
 
     def __init__(self, api_key: str | None = None):
-        import google.generativeai as genai
+        """
+        Initialize the SOC1 Agent.
 
+        Args:
+            api_key: Google API key. If not provided, uses GOOGLE_API_KEY env var.
+                     Get a free key at: https://aistudio.google.com/apikey
+        """
         self.api_key = api_key or os.environ.get("GOOGLE_API_KEY")
         if not self.api_key:
             raise ValueError(
@@ -263,7 +259,8 @@ class GeminiClient(BaseAIClient):
         # Use Gemini 1.5 Flash for free tier (fast and capable)
         self.model = genai.GenerativeModel("gemini-1.5-flash")
 
-    def generate(self, prompt: str, max_tokens: int = 8192) -> str:
+    def _generate(self, prompt: str, max_tokens: int = 8192) -> str:
+        """Generate a response from Gemini."""
         response = self.model.generate_content(
             prompt,
             generation_config={
@@ -273,88 +270,23 @@ class GeminiClient(BaseAIClient):
         )
         return response.text
 
+    def _parse_json_response(self, response_text: str) -> dict[str, Any]:
+        """Parse JSON from AI response, handling markdown code blocks."""
+        # Handle potential markdown code blocks
+        json_match = re.search(r"```(?:json)?\s*([\s\S]*?)\s*```", response_text)
+        if json_match:
+            response_text = json_match.group(1)
 
-class AnthropicClient(BaseAIClient):
-    """Anthropic Claude AI client."""
-
-    def __init__(self, api_key: str | None = None):
-        import anthropic
-
-        self.api_key = api_key or os.environ.get("ANTHROPIC_API_KEY")
-        if not self.api_key:
-            raise ValueError(
-                "Anthropic API key required. Set ANTHROPIC_API_KEY environment variable "
-                "or pass api_key parameter."
-            )
-        self.client = anthropic.Anthropic(api_key=self.api_key)
-        self.model_name = "claude-sonnet-4-20250514"
-
-    def generate(self, prompt: str, max_tokens: int = 8192) -> str:
-        response = self.client.messages.create(
-            model=self.model_name,
-            max_tokens=max_tokens,
-            messages=[{"role": "user", "content": prompt}],
-        )
-        return response.content[0].text
-
-
-def get_ai_client(provider: AIProvider | str | None = None, api_key: str | None = None) -> BaseAIClient:
-    """
-    Factory function to get the appropriate AI client.
-
-    Auto-detects provider based on available API keys if not specified.
-
-    Args:
-        provider: The AI provider to use (gemini, anthropic)
-        api_key: Optional API key (uses env vars if not provided)
-
-    Returns:
-        An AI client instance
-    """
-    if isinstance(provider, str):
-        provider = AIProvider(provider.lower())
-
-    # Auto-detect provider based on available API keys
-    if provider is None:
-        if os.environ.get("GOOGLE_API_KEY"):
-            provider = AIProvider.GEMINI
-        elif os.environ.get("ANTHROPIC_API_KEY"):
-            provider = AIProvider.ANTHROPIC
-        else:
-            raise ValueError(
-                "No AI API key found. Please set one of:\n"
-                "  - GOOGLE_API_KEY (free tier at https://aistudio.google.com/apikey)\n"
-                "  - ANTHROPIC_API_KEY"
-            )
-
-    if provider == AIProvider.GEMINI:
-        return GeminiClient(api_key)
-    elif provider == AIProvider.ANTHROPIC:
-        return AnthropicClient(api_key)
-    else:
-        raise ValueError(f"Unknown provider: {provider}")
-
-
-class SOC1Agent:
-    """
-    AI-powered agent for processing SOC1 Type II reports.
-
-    Supports multiple AI providers (Gemini, Anthropic).
-    """
-
-    def __init__(
-        self,
-        provider: AIProvider | str | None = None,
-        api_key: str | None = None,
-    ):
-        """
-        Initialize the SOC1 Agent.
-
-        Args:
-            provider: AI provider to use ('gemini' or 'anthropic'). Auto-detects if not specified.
-            api_key: API key for the provider. Uses environment variables if not provided.
-        """
-        self.client = get_ai_client(provider, api_key)
+        try:
+            return json.loads(response_text)
+        except json.JSONDecodeError:
+            # Try to find JSON object in response
+            json_start = response_text.find("{")
+            json_end = response_text.rfind("}") + 1
+            if json_start >= 0 and json_end > json_start:
+                return json.loads(response_text[json_start:json_end])
+            else:
+                raise ValueError(f"Could not parse AI response as JSON: {response_text[:500]}")
 
     def _create_extraction_prompt(
         self,
@@ -454,24 +386,6 @@ IMPORTANT:
 
 Return ONLY the JSON object, no additional text or markdown formatting."""
 
-    def _parse_json_response(self, response_text: str) -> dict[str, Any]:
-        """Parse JSON from AI response, handling markdown code blocks."""
-        # Handle potential markdown code blocks
-        json_match = re.search(r"```(?:json)?\s*([\s\S]*?)\s*```", response_text)
-        if json_match:
-            response_text = json_match.group(1)
-
-        try:
-            return json.loads(response_text)
-        except json.JSONDecodeError:
-            # Try to find JSON object in response
-            json_start = response_text.find("{")
-            json_end = response_text.rfind("}") + 1
-            if json_start >= 0 and json_end > json_start:
-                return json.loads(response_text[json_start:json_end])
-            else:
-                raise ValueError(f"Could not parse AI response as JSON: {response_text[:500]}")
-
     def extract_and_map(
         self,
         pdf_content: ExtractedPDFContent,
@@ -488,7 +402,7 @@ Return ONLY the JSON object, no additional text or markdown formatting."""
             Dict mapping sheet names to lists of row updates
         """
         prompt = self._create_extraction_prompt(pdf_content, template)
-        response_text = self.client.generate(prompt, max_tokens=8192)
+        response_text = self._generate(prompt, max_tokens=8192)
         return self._parse_json_response(response_text)
 
     def analyze_for_gaps(
@@ -532,7 +446,7 @@ Return a JSON object:
 
 Return ONLY the JSON object."""
 
-        response_text = self.client.generate(prompt, max_tokens=4096)
+        response_text = self._generate(prompt, max_tokens=4096)
 
         try:
             return self._parse_json_response(response_text)
@@ -544,7 +458,6 @@ async def process_soc1_documents(
     type_ii_path: Path,
     management_review_path: Path,
     output_dir: Path | None = None,
-    provider: AIProvider | str | None = None,
     api_key: str | None = None,
 ) -> dict[str, Any]:
     """
@@ -554,8 +467,7 @@ async def process_soc1_documents(
         type_ii_path: Path to the Type II report PDF
         management_review_path: Path to the management review Excel template
         output_dir: Directory to save output files (defaults to same as input)
-        provider: AI provider to use ('gemini' or 'anthropic'). Auto-detects if not specified.
-        api_key: Optional API key for the AI provider
+        api_key: Optional Google API key
 
     Returns:
         Dict containing:
@@ -582,8 +494,8 @@ async def process_soc1_documents(
         print(f"  - {sheet}: {len(headers)} columns")
 
     # Step 3: Initialize AI agent and process
-    print("Initializing AI agent for content mapping...")
-    agent = SOC1Agent(provider=provider, api_key=api_key)
+    print("Initializing Google Gemini AI agent...")
+    agent = SOC1Agent(api_key=api_key)
 
     print("Extracting and mapping content using AI...")
     mappings = agent.extract_and_map(pdf_content, template)
@@ -592,7 +504,7 @@ async def process_soc1_documents(
     output_filename = f"filled_{management_review_path.name}"
     output_path = output_dir / output_filename
 
-    print(f"Filling Excel template...")
+    print("Filling Excel template...")
     ExcelHandler.fill_template(workbook, template, mappings, output_path)
     print(f"  - Saved to: {output_path}")
 
@@ -614,7 +526,6 @@ def process_soc1_sync(
     type_ii_path: str | Path,
     management_review_path: str | Path,
     output_dir: str | Path | None = None,
-    provider: AIProvider | str | None = None,
     api_key: str | None = None,
 ) -> dict[str, Any]:
     """
@@ -624,8 +535,7 @@ def process_soc1_sync(
         type_ii_path: Path to the Type II report PDF
         management_review_path: Path to the management review Excel template
         output_dir: Directory to save output files
-        provider: AI provider ('gemini' or 'anthropic'). Auto-detects if not specified.
-        api_key: Optional API key for the provider
+        api_key: Optional Google API key
 
     Returns:
         Dict containing processing results
@@ -641,7 +551,6 @@ def process_soc1_sync(
             type_ii_path,
             management_review_path,
             output_dir,
-            provider,
             api_key,
         )
     )

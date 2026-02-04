@@ -90,18 +90,15 @@ async def upload(
         "management_review": management_review.filename,
     }
 
-    # Check if any AI API key is configured
-    has_google_key = bool(os.environ.get("GOOGLE_API_KEY"))
-    has_anthropic_key = bool(os.environ.get("ANTHROPIC_API_KEY"))
-
-    if not has_google_key and not has_anthropic_key:
+    # Check if Google API key is configured
+    if not os.environ.get("GOOGLE_API_KEY"):
         job_status[job_id].update({
             "status": "failed",
-            "message": "No AI API key configured. Please set GOOGLE_API_KEY (free) or ANTHROPIC_API_KEY.",
+            "message": "GOOGLE_API_KEY not configured. Get a free key at https://aistudio.google.com/apikey",
         })
         return {
             "job_id": job_id,
-            "message": "Upload complete but processing cannot start - no AI API key configured.",
+            "message": "Upload complete but processing cannot start - GOOGLE_API_KEY not configured.",
             "type_ii_report": {
                 "filename": type_ii_report.filename,
                 "bytes": len(type_ii_bytes),
@@ -112,7 +109,7 @@ async def upload(
             },
             "soc1_output": {
                 "status": "failed",
-                "preview": "Please set GOOGLE_API_KEY (free at https://aistudio.google.com/apikey) or ANTHROPIC_API_KEY.",
+                "preview": "Please set GOOGLE_API_KEY environment variable. Get a free key at https://aistudio.google.com/apikey",
             },
         }
 
