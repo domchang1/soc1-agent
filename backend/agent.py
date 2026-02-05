@@ -248,8 +248,22 @@ class ExcelHandler:
                 if row_idx <= header_row:
                     row_idx = header_row + 1
 
-                # Get confidence levels for this row (if provided)
-                confidence_map = row_update.get("_confidence", {})
+                # Get confidence levels for this row (supports multiple formats)
+                # Format 1: "_confidence": {"col_name": "high", ...}
+                # Format 2: "_c": {"col_name": "h", ...} (abbreviated)
+                # Format 3: "col_name": {"value": "x", "confidence": "high"}
+                confidence_map = row_update.get("_confidence", row_update.get("_c", {}))
+                row_confidence = row_update.get("_row_confidence", "high")
+                
+                # Normalize abbreviated confidence values
+                def normalize_confidence(c):
+                    if c in ("h", "high"):
+                        return "high"
+                    elif c in ("m", "medium", "med"):
+                        return "medium"
+                    elif c in ("l", "low"):
+                        return "low"
+                    return "high"  # default
 
                 for col_name, value in row_update.items():
                     if col_name.startswith("_"):
@@ -257,15 +271,21 @@ class ExcelHandler:
 
                     # Handle value with embedded confidence
                     cell_value = value
-                    cell_confidence = confidence_map.get(col_name, "high")
+                    raw_confidence = confidence_map.get(col_name, "high")
+                    cell_confidence = normalize_confidence(raw_confidence)
 
-                    # If value is a dict with value and confidence
                     if isinstance(value, dict):
-                        cell_value = value.get("value")
-                        cell_confidence = value.get("confidence", "high")
+                        cell_value = value.get("value", value.get("v"))
+                        raw_conf = value.get("confidence", value.get("c", raw_confidence))
+                        cell_confidence = normalize_confidence(raw_conf)
 
-                    # Skip if no value
-                    if cell_value is None:
+                    # Skip if no value or empty string
+                    if cell_value is None or cell_value == "":
+                        # Mark empty cells with low confidence
+                        col_idx = header_map.get(col_name) or header_map.get(col_name.lower().strip())
+                        if col_idx and confidence_map.get(col_name) == "low":
+                            cell = ws.cell(row=row_idx, column=col_idx)
+                            cell.fill = FILL_LOW_CONFIDENCE
                         continue
 
                     # Find the column index for this header
@@ -284,10 +304,8 @@ class ExcelHandler:
                         # High confidence = no fill (keep default)
 
                 # Apply row-level confidence coloring for empty/missing cells
-                row_confidence = row_update.get("_row_confidence", "high")
                 if row_confidence == "low":
-                    # Color all cells in the row that weren't filled
-                    for col_idx in range(1, len(template.headers.get(sheet_name, [])) + 1):
+                    for col_idx in range(1, len(template.headers.get(actual_sheet_name, [])) + 1):
                         cell = ws.cell(row=row_idx, column=col_idx)
                         if cell.value is None:
                             cell.fill = FILL_LOW_CONFIDENCE
@@ -322,62 +340,165 @@ class SOC1Agent:
         # Use Gemini 2.5 Flash for free tier (latest, fast and capable)
         self.model = genai.GenerativeModel("gemini-2.5-flash")
 
-    def _generate(self, prompt: str, max_tokens: int = 8192) -> str:
-        """Generate a response from Gemini."""
-        response = self.model.generate_content(
-            prompt,
-            generation_config={
-                "max_output_tokens": max_tokens,
-                "temperature": 0.1,  # Low temperature for accuracy
-            },
-        )
-        return response.text
+    def _generate(self, prompt: str, max_tokens: int = 8192, retries: int = 3) -> str:
+        """Generate a response from Gemini with retry logic."""
+        import time
+        
+        last_error = None
+        for attempt in range(retries):
+            try:
+                response = self.model.generate_content(
+                    prompt,
+                    generation_config={
+                        "max_output_tokens": max_tokens,
+                        "temperature": 0.1,  # Low temperature for accuracy
+                    },
+                )
+                
+                # Check if response has text
+                if response.text:
+                    return response.text
+                    
+                # Check for blocked content or other issues
+                if hasattr(response, 'prompt_feedback'):
+                    print(f"Prompt feedback: {response.prompt_feedback}")
+                if hasattr(response, 'candidates') and response.candidates:
+                    candidate = response.candidates[0]
+                    if hasattr(candidate, 'finish_reason'):
+                        print(f"Finish reason: {candidate.finish_reason}")
+                    if hasattr(candidate, 'content') and candidate.content:
+                        if hasattr(candidate.content, 'parts') and candidate.content.parts:
+                            return candidate.content.parts[0].text
+                
+                raise ValueError("Empty response from Gemini")
+                
+            except Exception as e:
+                last_error = e
+                print(f"Attempt {attempt + 1}/{retries} failed: {str(e)}")
+                if attempt < retries - 1:
+                    wait_time = (attempt + 1) * 2  # Exponential backoff
+                    print(f"Waiting {wait_time}s before retry...")
+                    time.sleep(wait_time)
+        
+        raise RuntimeError(f"Failed after {retries} attempts. Last error: {last_error}")
 
     def _parse_json_response(self, response_text: str) -> dict[str, Any]:
         """Parse JSON from AI response, handling markdown code blocks and incomplete JSON."""
         original_text = response_text
         
-        # Handle potential markdown code blocks
+        # Step 1: Remove markdown code block markers (handle both complete and incomplete blocks)
+        # First try to match complete code blocks
         json_match = re.search(r"```(?:json)?\s*([\s\S]*?)\s*```", response_text)
         if json_match:
             response_text = json_match.group(1).strip()
+        else:
+            # Handle incomplete code blocks (no closing ```)
+            if response_text.strip().startswith("```"):
+                # Remove opening ``` and optional json tag
+                response_text = re.sub(r"^```(?:json)?\s*", "", response_text.strip())
+            # Also remove any trailing ``` if present
+            response_text = re.sub(r"\s*```\s*$", "", response_text)
 
+        # Step 2: Try direct parsing
         try:
             return json.loads(response_text)
+        except json.JSONDecodeError:
+            pass
+
+        # Step 3: Find the JSON object boundaries
+        json_start = response_text.find("{")
+        if json_start < 0:
+            print(f"No JSON object found in response: {original_text[:500]}")
+            raise ValueError(f"No JSON object found in AI response. Response: {original_text[:200]}...")
+
+        # Step 4: Try to extract valid JSON
+        json_candidate = response_text[json_start:]
+        
+        # Try parsing as-is first
+        try:
+            return json.loads(json_candidate)
+        except json.JSONDecodeError:
+            pass
+
+        # Step 5: Try to repair truncated JSON
+        # Find the last valid closing brace
+        json_candidate = self._repair_truncated_json(json_candidate)
+        
+        try:
+            result = json.loads(json_candidate)
+            print(f"Successfully parsed JSON after repair (found {len(result)} keys)")
+            return result
         except json.JSONDecodeError as e:
-            # Try to find and extract JSON object in response
-            json_start = response_text.find("{")
-            json_end = response_text.rfind("}") + 1
-            
-            if json_start >= 0 and json_end > json_start:
-                json_candidate = response_text[json_start:json_end]
-                try:
-                    return json.loads(json_candidate)
-                except json.JSONDecodeError:
-                    # Try to fix common issues with incomplete JSON
-                    # Remove trailing incomplete arrays/objects
-                    json_candidate = re.sub(r'[,\s]*[\[\{][^\[\}]*$', '', json_candidate)
-                    # Ensure the JSON ends properly
-                    open_braces = json_candidate.count('{') - json_candidate.count('}')
-                    open_brackets = json_candidate.count('[') - json_candidate.count(']')
-                    
-                    for _ in range(open_brackets):
-                        json_candidate += ']'
-                    for _ in range(open_braces):
-                        json_candidate += '}'
-                    
-                    try:
-                        return json.loads(json_candidate)
-                    except json.JSONDecodeError:
-                        pass
-            
             # Log detailed error for debugging
-            print(f"Failed to parse JSON response. Original text:\n{original_text[:1000]}")
-            print(f"Error at position {e.pos}: {e.msg}")
+            print(f"Failed to parse JSON response after repair attempts.")
+            print(f"JSON error: {e.msg} at position {e.pos}")
+            print(f"Context around error: ...{json_candidate[max(0,e.pos-50):e.pos+50]}...")
+            print(f"Original text length: {len(original_text)}")
+            print(f"Repaired text length: {len(json_candidate)}")
+            
+            # Last resort: try to extract just the first complete sheet
+            try:
+                # Find the first complete array in the JSON
+                first_array_end = json_candidate.find(']')
+                if first_array_end > 0:
+                    partial = json_candidate[:first_array_end + 1] + '}'
+                    result = json.loads(partial)
+                    print(f"Recovered partial JSON with {len(result)} keys")
+                    return result
+            except:
+                pass
+            
             raise ValueError(
-                f"Could not parse AI response as JSON. This may indicate the AI returned incomplete or malformed data. "
-                f"Error: {e.msg} at position {e.pos}. Response: {original_text[:200]}..."
+                f"Could not parse AI response as JSON. The response may be truncated. "
+                f"Response preview: {original_text[:300]}..."
             )
+
+    def _repair_truncated_json(self, json_str: str) -> str:
+        """Attempt to repair truncated JSON by closing open brackets and braces."""
+        # Strategy: Find the last complete row entry and truncate there
+        
+        # First, try to find the last complete object in an array
+        # Look for pattern: }, { which indicates complete objects in array
+        last_complete = json_str.rfind('},')
+        if last_complete > 0:
+            # Check if cutting here gives us valid-ish JSON
+            test_str = json_str[:last_complete + 1]  # Include the }
+            open_braces = test_str.count('{') - test_str.count('}')
+            open_brackets = test_str.count('[') - test_str.count(']')
+            
+            # If we have more opens than closes, this might be a good cut point
+            if open_braces >= 0 and open_brackets >= 0:
+                json_str = test_str
+        
+        # Remove any trailing incomplete content
+        # Pattern 1: Incomplete key-value with nested object: "key": {incomplete
+        json_str = re.sub(r',\s*"[^"]*"\s*:\s*\{[^{}]*$', '', json_str)
+        # Pattern 2: Incomplete key-value with string: "key": "incomplete
+        json_str = re.sub(r',\s*"[^"]*"\s*:\s*"[^"]*$', '', json_str)
+        # Pattern 3: Incomplete key-value with object having confidence: "key": {"value": "x", "confidence
+        json_str = re.sub(r',\s*"[^"]*"\s*:\s*\{[^{}]*$', '', json_str)
+        # Pattern 4: Just an incomplete key: , "key
+        json_str = re.sub(r',\s*"[^"]*$', '', json_str)
+        # Pattern 5: Incomplete array element
+        json_str = re.sub(r',\s*\[[^\[\]]*$', '', json_str)
+        json_str = re.sub(r',\s*\{[^{}]*$', '', json_str)
+        
+        # Remove trailing comma if present
+        json_str = re.sub(r',\s*$', '', json_str)
+        
+        # Count and balance brackets/braces
+        open_braces = json_str.count('{') - json_str.count('}')
+        open_brackets = json_str.count('[') - json_str.count(']')
+        
+        print(f"Repair: {open_brackets} unclosed brackets, {open_braces} unclosed braces")
+        
+        # Close any remaining open structures (close brackets before braces)
+        for _ in range(max(0, open_brackets)):
+            json_str += ']'
+        for _ in range(max(0, open_braces)):
+            json_str += '}'
+        
+        return json_str
 
     def _create_extraction_prompt(
         self,
@@ -414,88 +535,48 @@ class SOC1Agent:
                 for row in table[:20]:  # Limit rows per table
                     tables_info += f"  {row}\n"
 
-        return f"""You are an expert at analyzing SOC1 Type II audit reports and extracting relevant information to fill management review templates.
+        # Find sheets that match management review and CUEC patterns
+        management_sheet = None
+        cuec_sheet = None
+        for sheet_name in template.sheet_names:
+            sheet_lower = sheet_name.lower()
+            if "management review" in sheet_lower:
+                management_sheet = sheet_name
+            if "user entity" in sheet_lower or "cuec" in sheet_lower or "comp user" in sheet_lower:
+                cuec_sheet = sheet_name
 
-## Task
-Analyze the following SOC1 Type II report content and extract information to fill the management review Excel template. You must fill out TWO sections:
-1. "1.0 Management Review" - Controls and test results
-2. "2.0.b Complimentary User Entity Controls" - CUECs from the report
+        # Get column names for the key sheets
+        mgmt_cols = template.headers.get(management_sheet, [])[:10] if management_sheet else []
+        cuec_cols = template.headers.get(cuec_sheet, [])[:7] if cuec_sheet else []
 
-## Excel Template Structure
-{template_info}
+        return f"""Extract SOC1 data to fill Excel template. Be CONCISE.
 
-## SOC1 Type II Report Content
-{pdf_content.full_text[:50000]}
-{tables_info}
+SHEETS TO FILL:
+1. "{management_sheet}" - columns: {', '.join(mgmt_cols[:8])}...
+2. "{cuec_sheet}" - columns: {', '.join(cuec_cols)}
 
-## Instructions
+PDF CONTENT:
+{pdf_content.full_text[:60000]}
 
-### CONFIDENCE LEVELS (CRITICAL)
-For EACH cell value, you must indicate your confidence level:
-- "high": You found clear, explicit information in the PDF for this field
-- "medium": You found some related information but had to infer or the info is incomplete
-- "low": You could not find information for this field (leave value empty or provide best guess)
-
-### Return Format
-Return a JSON object with this structure:
+OUTPUT FORMAT (JSON only, no markdown):
 {{
-    "1.0 Management Review": [
-        {{
-            "_row": 2,
-            "_row_confidence": "high",
-            "Column Name": {{"value": "the value", "confidence": "high"}},
-            "Another Column": {{"value": "partial info", "confidence": "medium"}},
-            "Missing Column": {{"value": "", "confidence": "low"}},
-            ...
-        }},
-        ...
-    ],
-    "2.0.b Complimentary User Entity Controls": [
-        {{
-            "_row": 2,
-            "_row_confidence": "high",
-            "Column Name": {{"value": "CUEC description", "confidence": "high"}},
-            ...
-        }},
-        ...
-    ]
+  "{management_sheet}": [
+    {{"_row": 2, "_c": {{"col1": "h"}}, "col1": "value", "col2": "value"}},
+    {{"_row": 3, "_c": {{"col1": "m"}}, "col1": "value"}}
+  ],
+  "{cuec_sheet}": [
+    {{"_row": 2, "col1": "CUEC description"}}
+  ]
 }}
 
-### Section 1: Management Review
-Extract from the SOC1 report:
-- Control ID/Number
-- Control Description/Objective
-- Control Owner/Responsible Party
-- Test Procedure Performed
-- Sample Size
-- Test Result (Effective/Exception/N/A)
-- Exception Details (if any)
-- Management Response
-- Remediation Status
-- Auditor conclusions
+CONFIDENCE in "_c" field: "h"=high (found), "m"=medium (inferred), "l"=low (not found)
 
-### Section 2: Complementary User Entity Controls (CUECs)
-Look for sections in the PDF titled:
-- "Complementary User Entity Controls"
-- "User Entity Controls"
-- "User Control Considerations"
-- "CUECs"
-
-CUECs are controls that user organizations (clients) are expected to implement. Extract:
-- CUEC ID/Reference number
-- CUEC Description
-- Related control objective
-- Any implementation guidance
-
-### IMPORTANT RULES
-1. Use EXACT sheet names and column names from the template (case-sensitive)
-2. Row numbers start from 2 (row 1 is headers)
-3. Create one entry per control/CUEC identified
-4. If a sheet doesn't exist in the template, skip it
-5. If you cannot find CUECs section, return an empty array for that sheet
-6. ALWAYS include confidence for each value
-
-Return ONLY the JSON object, no additional text or markdown formatting."""
+RULES:
+- Use EXACT column names from template
+- Keep values SHORT (max 100 chars)
+- One row per control/CUEC
+- Skip columns with no data
+- For CUECs: find "Complementary User Entity Controls" section"""
 
     def extract_and_map(
         self,
@@ -512,9 +593,70 @@ Return ONLY the JSON object, no additional text or markdown formatting."""
         Returns:
             Dict mapping sheet names to lists of row updates
         """
-        prompt = self._create_extraction_prompt(pdf_content, template)
-        response_text = self._generate(prompt, max_tokens=8192)
-        return self._parse_json_response(response_text)
+        try:
+            prompt = self._create_extraction_prompt(pdf_content, template)
+            # Use larger token limit to avoid truncation
+            response_text = self._generate(prompt, max_tokens=65536)
+            return self._parse_json_response(response_text)
+        except Exception as e:
+            print(f"Main extraction failed: {e}")
+            print("Trying simplified extraction...")
+            return self._extract_simplified(pdf_content, template)
+
+    def _extract_simplified(
+        self,
+        pdf_content: ExtractedPDFContent,
+        template: ExcelTemplate,
+    ) -> dict[str, list[dict[str, Any]]]:
+        """Simplified extraction as fallback - extracts one sheet at a time."""
+        result = {}
+        
+        for sheet_name in template.sheet_names:
+            sheet_lower = sheet_name.lower()
+            
+            # Only process relevant sheets
+            if not any(x in sheet_lower for x in ["management review", "user entity", "cuec", "comp user"]):
+                continue
+            
+            headers = template.headers.get(sheet_name, [])
+            if not headers:
+                continue
+            
+            prompt = f"""Extract data from this SOC1 report to fill the Excel sheet "{sheet_name}".
+
+Sheet columns: {', '.join(headers[:15])}  
+
+PDF Content (excerpt):
+{pdf_content.full_text[:40000]}
+
+Return a JSON array of rows. Each row has "_row" (starting at 2) and column values.
+Keep values SHORT and concise. Example:
+[
+  {{"_row": 2, "{headers[0] if headers else 'Col1'}": "value1", "{headers[1] if len(headers) > 1 else 'Col2'}": "value2"}},
+  {{"_row": 3, "{headers[0] if headers else 'Col1'}": "value3"}}
+]
+
+Return ONLY the JSON array."""
+
+            try:
+                response = self._generate(prompt, max_tokens=16384)
+                rows = self._parse_json_response(response)
+                
+                # Handle both array and object responses
+                if isinstance(rows, list):
+                    result[sheet_name] = rows
+                elif isinstance(rows, dict):
+                    # If it returned an object with the sheet name as key
+                    if sheet_name in rows:
+                        result[sheet_name] = rows[sheet_name]
+                    else:
+                        # Wrap single row in array
+                        result[sheet_name] = [rows] if "_row" in rows else []
+            except Exception as e:
+                print(f"Failed to extract sheet {sheet_name}: {e}")
+                result[sheet_name] = []
+        
+        return result
 
     def analyze_for_gaps(
         self,
