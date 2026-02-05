@@ -27,7 +27,7 @@ type JobStatus = {
   };
 };
 
-const API_BASE = import.meta.env.VITE_API_URL || "http://localhost:8000/api";
+const API_BASE = import.meta.env.VITE_API_URL || "https://soc1-agent.onrender.com/api";
 
 export default function App() {
   const [typeIiFile, setTypeIiFile] = useState<File | null>(null);
