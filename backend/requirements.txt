@@ -4,4 +4,4 @@ python-multipart
 python-dotenv
 pdfplumber
 openpyxl
-google-generativeai
+google-genai

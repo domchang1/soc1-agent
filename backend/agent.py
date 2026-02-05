@@ -17,7 +17,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-import google.generativeai as genai
+from google import genai
+from google.genai import types
 import openpyxl
 import pdfplumber
 from dotenv import load_dotenv
@@ -349,40 +350,51 @@ class SOC1Agent:
                 "or pass api_key parameter.\n"
                 "Get a free key at: https://aistudio.google.com/apikey"
             )
-        genai.configure(api_key=self.api_key)
+        # Initialize the genai client with API key
+        self.client = genai.Client(api_key=self.api_key)
         # Use Gemini 2.5 Flash for free tier (latest, fast and capable)
-        self.model = genai.GenerativeModel("gemini-2.5-flash")
+        self.model = "gemini-2.5-flash"
 
-    def _generate(self, prompt: str, max_tokens: int = 8192, retries: int = 3) -> str:
+    def _generate(self,
+        prompt: str,
+        max_tokens: int = 8192,
+        retries: int = 3,
+        expect_json: bool = False) -> str:
         """Generate a response from Gemini with retry logic."""
         import time
         
         last_error = None
         for attempt in range(retries):
             try:
-                response = self.model.generate_content(
-                    prompt,
-                    generation_config={
-                        "max_output_tokens": max_tokens,
-                        "temperature": 0.1,  # Low temperature for accuracy
-                    },
+
+                config_kwargs = dict(
+                    max_output_tokens=max_tokens,
+                    temperature=0.1,
+                )
+                if expect_json:
+                    config_kwargs["response_mime_type"] = "application/json"
+
+                response = self.client.models.generate_content(
+                    model=self.model,
+                    contents=prompt,
+                    config=types.GenerateContentConfig(**config_kwargs),
                 )
                 
                 # Check if response has text
-                if response.text:
+                if getattr(response, "text", None):
                     return response.text
-                    
-                # Check for blocked content or other issues
-                if hasattr(response, 'prompt_feedback'):
-                    print(f"Prompt feedback: {response.prompt_feedback}")
-                if hasattr(response, 'candidates') and response.candidates:
-                    candidate = response.candidates[0]
-                    if hasattr(candidate, 'finish_reason'):
-                        print(f"Finish reason: {candidate.finish_reason}")
-                    if hasattr(candidate, 'content') and candidate.content:
-                        if hasattr(candidate.content, 'parts') and candidate.content.parts:
-                            return candidate.content.parts[0].text
-                
+
+                # Fallback: pull text from candidates/parts when response.text is empty
+                if getattr(response, "candidates", None):
+                    cand0 = response.candidates[0]
+                    content = getattr(cand0, "content", None)
+                    parts = getattr(content, "parts", None) if content else None
+                    if parts:
+                        for p in parts:
+                            t = getattr(p, "text", None)
+                            if t:
+                                return t
+
                 raise ValueError("Empty response from Gemini")
                 
             except Exception as e:
@@ -571,7 +583,7 @@ SHEETS TO FILL:
 PDF CONTENT:
 {pdf_content.full_text[:60000]}
 
-OUTPUT FORMAT (JSON only, no markdown):
+Return ONLY valid JSON. No markdown, no commentary.
 {{
   "{management_sheet}": [
     {{"_row": 2, "_c": {{"col1": "h"}}, "col1": "value", "col2": "value"}},
@@ -609,7 +621,7 @@ RULES:
         try:
             prompt = self._create_extraction_prompt(pdf_content, template)
             # Use larger token limit to avoid truncation
-            response_text = self._generate(prompt, max_tokens=65536)
+            response_text = self._generate(prompt, max_tokens=65536, expect_json=True)
             return self._parse_json_response(response_text)
         except Exception as e:
             print(f"Main extraction failed: {e}")
@@ -652,7 +664,7 @@ Keep values SHORT and concise. Example:
 Return ONLY the JSON array."""
 
             try:
-                response = self._generate(prompt, max_tokens=16384)
+                response = self._generate(prompt, max_tokens=16384, expect_json=True)
                 rows = self._parse_json_response(response)
                 
                 # Handle both array and object responses
@@ -720,7 +732,7 @@ Return a JSON object:
 
 Return ONLY the JSON object."""
 
-        response_text = self._generate(prompt, max_tokens=4096)
+        response_text = self._generate(prompt, max_tokens=4096, expect_json=True)
 
         try:
             return self._parse_json_response(response_text)
