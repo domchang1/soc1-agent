@@ -76,56 +76,89 @@ export default function App() {
         setCanDownload(true);
 
         const summary = data.analysis_summary;
-        const outputLines = [
-          "✓ Processing Complete!",
-          "",
-          "═══ Analysis Summary ═══",
-          "",
-          "Controls:",
-          `  • Total Controls Identified: ${summary?.total_controls ?? "N/A"}`,
-          `  • Controls with Exceptions: ${summary?.exceptions ?? "N/A"}`,
-          "",
-          "Complementary User Entity Controls (CUECs):",
-          `  • Total CUECs Identified: ${summary?.total_cuecs ?? "N/A"}`,
-          "",
-        ];
+        
+        // Build HTML output with sections
+        const outputHTML = `
+<div class="output-section success">
+  <h3 class="output-section-title">✓ Processing Complete</h3>
+  <div class="output-stat">
+    <div class="stat-item">
+      <div class="stat-label">Total Controls</div>
+      <div class="stat-value">${summary?.total_controls ?? "N/A"}</div>
+    </div>
+    <div class="stat-item">
+      <div class="stat-label">With Exceptions</div>
+      <div class="stat-value">${summary?.exceptions ?? "0"}</div>
+    </div>
+    <div class="stat-item">
+      <div class="stat-label">CUECs Found</div>
+      <div class="stat-value">${summary?.total_cuecs ?? "0"}</div>
+    </div>
+  </div>
+</div>
 
-        // Add confidence review info
-        if (summary?.cells_needing_review) {
-          outputLines.push("Cells Needing Review:");
-          outputLines.push(`  • Low confidence (red): ${summary.cells_needing_review.low_confidence ?? 0}`);
-          outputLines.push(`  • Medium confidence (yellow): ${summary.cells_needing_review.medium_confidence ?? 0}`);
-          outputLines.push("");
-        }
+${summary?.cells_needing_review ? `
+<div class="output-section">
+  <h3 class="output-section-title">Confidence Review</h3>
+  <div class="output-stat">
+    <div class="stat-item">
+      <div class="stat-label">Low Confidence</div>
+      <div class="stat-value" style="color: #fca5a5;">${summary.cells_needing_review.low_confidence ?? 0}</div>
+    </div>
+    <div class="stat-item">
+      <div class="stat-label">Medium Confidence</div>
+      <div class="stat-value" style="color: #fef08a;">${summary.cells_needing_review.medium_confidence ?? 0}</div>
+    </div>
+  </div>
+</div>
+` : ""}
 
-        if (summary?.summary) {
-          outputLines.push("Summary:", summary.summary, "");
-        }
+${summary?.summary ? `
+<div class="output-section">
+  <h3 class="output-section-title">Summary</h3>
+  <div class="output-content">${summary.summary}</div>
+</div>
+` : ""}
 
-        if (summary?.key_findings && summary.key_findings.length > 0) {
-          outputLines.push("Key Findings:");
-          summary.key_findings.forEach((finding, i) => {
-            outputLines.push(`  ${i + 1}. ${finding}`);
-          });
-          outputLines.push("");
-        }
+${summary?.key_findings && summary.key_findings.length > 0 ? `
+<div class="output-section">
+  <h3 class="output-section-title">Key Findings</h3>
+  <ul class="output-findings">
+    ${summary.key_findings.map((f: string) => `<li>${f}</li>`).join("")}
+  </ul>
+</div>
+` : ""}
 
-        if (summary?.cuec_findings && summary.cuec_findings.length > 0) {
-          outputLines.push("CUEC Findings:");
-          summary.cuec_findings.forEach((finding, i) => {
-            outputLines.push(`  ${i + 1}. ${finding}`);
-          });
-          outputLines.push("");
-        }
+${summary?.cuec_findings && summary.cuec_findings.length > 0 ? `
+<div class="output-section">
+  <h3 class="output-section-title">CUEC Findings</h3>
+  <ul class="output-findings cuec">
+    ${summary.cuec_findings.map((f: string) => `<li>${f}</li>`).join("")}
+  </ul>
+</div>
+` : ""}
 
-        outputLines.push("═══ Color Legend ═══");
-        outputLines.push("  • No color: High confidence (info found in PDF)");
-        outputLines.push("  • Yellow: Medium confidence (partial/inferred info)");
-        outputLines.push("  • Red: Low confidence (info not found)");
-        outputLines.push("");
-        outputLines.push("Click 'Download Result' to get the filled Excel file.");
+<div class="output-section">
+  <h3 class="output-section-title">Color Legend</h3>
+  <div class="output-legend">
+    <div class="legend-item">
+      <div class="legend-color high"></div>
+      <span>High confidence (found in PDF)</span>
+    </div>
+    <div class="legend-item">
+      <div class="legend-color medium"></div>
+      <span>Medium confidence (partial/inferred)</span>
+    </div>
+    <div class="legend-item">
+      <div class="legend-color low"></div>
+      <span>Low confidence (not found)</span>
+    </div>
+  </div>
+</div>
+`;
 
-        setOutput(outputLines.join("\n"));
+        // Store as HTML instead of plain text
+        setOutput(outputHTML);
 
         // Stop polling
         if (pollingRef.current) {
@@ -347,7 +380,11 @@ export default function App() {
           )}
         </div>
         <div className={`output ${output ? "" : "output-empty"}`}>
-          {output || "Upload files to begin."}
+          {output ? (
+            <div dangerouslySetInnerHTML={{ __html: output }} />
+          ) : (
+            "Upload files to begin."
+          )}
         </div>
       </section>
     </div>

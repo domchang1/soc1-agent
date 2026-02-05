@@ -206,6 +206,10 @@ class ExcelHandler:
             - Medium confidence: Light yellow background
             - Low confidence: Light red background (missing info)
         """
+        print(f"fill_template called with {len(mappings)} sheets")
+        print(f"Available sheets in workbook: {wb.sheetnames}")
+        print(f"Mappings keys: {list(mappings.keys())}")
+        
         for sheet_name, rows in mappings.items():
             # Find matching sheet (exact or fuzzy match)
             actual_sheet_name = None
@@ -233,20 +237,25 @@ class ExcelHandler:
                 print(f"Warning: Sheet '{sheet_name}' not found in workbook. Available: {wb.sheetnames}")
                 continue
 
+            print(f"Processing sheet '{sheet_name}' -> actual: '{actual_sheet_name}' with {len(rows)} rows")
             ws = wb[actual_sheet_name]
             # Use the actual sheet name for header lookup
             sheet_name = actual_sheet_name
             header_map = template.header_to_col.get(sheet_name, {})
             header_row = template.header_row.get(sheet_name, 1)
+            print(f"  Header row: {header_row}, columns: {len(header_map)}")
 
-            for row_update in rows:
+            for row_idx_in, row_update in enumerate(rows):
                 row_idx = row_update.get("_row")
                 if row_idx is None:
+                    print(f"    Row {row_idx_in}: No _row field, skipping")
                     continue
 
                 # Ensure row_idx is after header row
                 if row_idx <= header_row:
                     row_idx = header_row + 1
+                
+                cells_written = 0
 
                 # Get confidence levels for this row (supports multiple formats)
                 # Format 1: "_confidence": {"col_name": "high", ...}
@@ -295,6 +304,7 @@ class ExcelHandler:
 
                     if col_idx:
                         cell = ws.cell(row=row_idx, column=col_idx, value=cell_value)
+                        cells_written += 1
 
                         # Apply confidence-based coloring
                         if cell_confidence == "low":
@@ -302,6 +312,9 @@ class ExcelHandler:
                         elif cell_confidence == "medium":
                             cell.fill = FILL_MEDIUM_CONFIDENCE
                         # High confidence = no fill (keep default)
+                
+                if cells_written > 0:
+                    print(f"    Row {row_idx}: Wrote {cells_written} cells")
 
                 # Apply row-level confidence coloring for empty/missing cells
                 if row_confidence == "low":
