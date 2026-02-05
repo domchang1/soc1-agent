@@ -42,6 +42,8 @@ async def process_job(job_id: str, type_ii_path: Path, management_path: Path):
 
         # Use a temporary directory for the processing pipeline
         import tempfile
+        import shutil
+        
         temp_dir = tempfile.mkdtemp()
 
         result = await process_soc1_documents(
@@ -67,8 +69,11 @@ async def process_job(job_id: str, type_ii_path: Path, management_path: Path):
         })
 
         # Clean up temporary files after reading
-        import shutil
         shutil.rmtree(temp_dir, ignore_errors=True)
+        
+        # Clean up uploaded files
+        type_ii_path.unlink(missing_ok=True)
+        management_path.unlink(missing_ok=True)
 
     except Exception as e:
         job_status[job_id].update({
@@ -76,6 +81,10 @@ async def process_job(job_id: str, type_ii_path: Path, management_path: Path):
             "message": f"Processing failed: {str(e)}",
             "error": traceback.format_exc(),
         })
+        
+        # Clean up uploaded files even on error
+        type_ii_path.unlink(missing_ok=True)
+        management_path.unlink(missing_ok=True)
 
 
 @app.post("/api/upload")
@@ -206,3 +215,44 @@ def download_result(job_id: str):
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         headers={"Content-Disposition": f"attachment; filename={filename}"},
     )
+
+
+@app.post("/api/cleanup-uploads")
+def cleanup_uploads() -> dict[str, Any]:
+    """Manually clear all files in the uploads folder."""
+    import shutil
+    
+    upload_root = Path("uploads")
+    
+    if not upload_root.exists():
+        return {
+            "status": "success",
+            "message": "Uploads folder does not exist",
+            "files_deleted": 0,
+        }
+    
+    files_deleted = 0
+    errors = []
+    
+    try:
+        for file_path in upload_root.iterdir():
+            if file_path.is_file():
+                try:
+                    file_path.unlink()
+                    files_deleted += 1
+                except Exception as e:
+                    errors.append(f"Failed to delete {file_path.name}: {str(e)}")
+        
+        return {
+            "status": "success",
+            "message": f"Deleted {files_deleted} file(s) from uploads folder",
+            "files_deleted": files_deleted,
+            "errors": errors if errors else None,
+        }
+    except Exception as e:
+        return {
+            "status": "failed",
+            "message": f"Cleanup failed: {str(e)}",
+            "files_deleted": 0,
+            "error": str(e),
+        }
