@@ -13,7 +13,7 @@ AI-powered tool for processing SOC1 Type II audit reports and automatically fill
 
 - Python 3.10+
 - Node.js 18+
-- Google API key (free) - Get at https://aistudio.google.com/apikey
+- Google API key (https://aistudio.google.com/apikey)
 
 ## Setup
 
@@ -25,8 +25,8 @@ python -m venv .venv
 source .venv/bin/activate  # On Windows: .venv\Scripts\activate
 pip install -r requirements.txt
 
-# Set your Google API key (free)
-export GOOGLE_API_KEY="your-google-api-key"
+# Set your Google API key (free) in the .env file
+GOOGLE_API_KEY="your-google-api-key"
 
 # Run the server
 uvicorn main:app --reload --port 8000

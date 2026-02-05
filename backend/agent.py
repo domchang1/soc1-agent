@@ -319,8 +319,8 @@ class SOC1Agent:
                 "Get a free key at: https://aistudio.google.com/apikey"
             )
         genai.configure(api_key=self.api_key)
-        # Use Gemini 1.5 Flash for free tier (fast and capable)
-        self.model = genai.GenerativeModel("gemini-1.5-flash")
+        # Use Gemini 2.5 Flash for free tier (latest, fast and capable)
+        self.model = genai.GenerativeModel("gemini-2.5-flash")
 
     def _generate(self, prompt: str, max_tokens: int = 8192) -> str:
         """Generate a response from Gemini."""
@@ -334,22 +334,50 @@ class SOC1Agent:
         return response.text
 
     def _parse_json_response(self, response_text: str) -> dict[str, Any]:
-        """Parse JSON from AI response, handling markdown code blocks."""
+        """Parse JSON from AI response, handling markdown code blocks and incomplete JSON."""
+        original_text = response_text
+        
         # Handle potential markdown code blocks
         json_match = re.search(r"```(?:json)?\s*([\s\S]*?)\s*```", response_text)
         if json_match:
-            response_text = json_match.group(1)
+            response_text = json_match.group(1).strip()
 
         try:
             return json.loads(response_text)
-        except json.JSONDecodeError:
-            # Try to find JSON object in response
+        except json.JSONDecodeError as e:
+            # Try to find and extract JSON object in response
             json_start = response_text.find("{")
             json_end = response_text.rfind("}") + 1
+            
             if json_start >= 0 and json_end > json_start:
-                return json.loads(response_text[json_start:json_end])
-            else:
-                raise ValueError(f"Could not parse AI response as JSON: {response_text[:500]}")
+                json_candidate = response_text[json_start:json_end]
+                try:
+                    return json.loads(json_candidate)
+                except json.JSONDecodeError:
+                    # Try to fix common issues with incomplete JSON
+                    # Remove trailing incomplete arrays/objects
+                    json_candidate = re.sub(r'[,\s]*[\[\{][^\[\}]*$', '', json_candidate)
+                    # Ensure the JSON ends properly
+                    open_braces = json_candidate.count('{') - json_candidate.count('}')
+                    open_brackets = json_candidate.count('[') - json_candidate.count(']')
+                    
+                    for _ in range(open_brackets):
+                        json_candidate += ']'
+                    for _ in range(open_braces):
+                        json_candidate += '}'
+                    
+                    try:
+                        return json.loads(json_candidate)
+                    except json.JSONDecodeError:
+                        pass
+            
+            # Log detailed error for debugging
+            print(f"Failed to parse JSON response. Original text:\n{original_text[:1000]}")
+            print(f"Error at position {e.pos}: {e.msg}")
+            raise ValueError(
+                f"Could not parse AI response as JSON. This may indicate the AI returned incomplete or malformed data. "
+                f"Error: {e.msg} at position {e.pos}. Response: {original_text[:200]}..."
+            )
 
     def _create_extraction_prompt(
         self,
