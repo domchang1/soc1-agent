@@ -1,6 +1,6 @@
 # SOC 1 Type II Management Review Generator
 
-AI-powered tool for processing SOC1 Type II audit reports and automatically filling management review Excel templates.
+AI-powered tool for processing SOC1 Type II audit reports and automatically filling management review Excel templates. Find [here](https://soc1-agent.vercel.app/)
 
 ## Features
 
@@ -59,10 +59,13 @@ Open `http://localhost:5173` to use the UI.
 
 ## API Endpoints
 
-- `GET /api/health` - Health check
+- `GET /api/health` - Health check endpoint
 - `POST /api/upload` - Upload files and start processing
-- `GET /api/status/{job_id}` - Check processing status
+  - Accepts: `type_ii_report` (PDF), `management_review` (Excel)
+  - Returns: `job_id` for status polling
+- `GET /api/status/{job_id}` - Check processing status and get analysis summary
 - `GET /api/download/{job_id}` - Download the filled Excel file
+- `POST /api/cleanup-uploads` - Clear temporary upload files (maintenance)
 
 ## Architecture
 
@@ -71,12 +74,12 @@ Open `http://localhost:5173` to use the UI.
 │   Frontend      │────▶│   FastAPI       │────▶│   Gemini AI     │
 │   (React)       │     │   Backend       │     │   (Free Tier)   │
 └─────────────────┘     └─────────────────┘     └─────────────────┘
-                               │                        │
-                               ▼                        ▼
-                        ┌─────────────────┐     ┌─────────────────┐
-                        │   pdfplumber    │     │   openpyxl      │
-                        │   (PDF Extract) │     │   (Excel Write) │
-                        └─────────────────┘     └─────────────────┘
+                              │                        │
+                              ▼                        ▼
+                       ┌─────────────────┐     ┌─────────────────┐
+                       │   pdfplumber    │     │   openpyxl      │
+                       │   (PDF Extract) │     │   (Excel Write) │
+                       └─────────────────┘     └─────────────────┘
 ```
 
 ## Dependencies
@@ -87,6 +90,7 @@ Open `http://localhost:5173` to use the UI.
 - `pdfplumber` - PDF text and table extraction
 - `openpyxl` - Excel file manipulation
 - `google-generativeai` - Google Gemini AI client
+- `python-dotenv` - Environment variable management
 
 ### Frontend
 - React 18
@@ -98,8 +102,57 @@ Open `http://localhost:5173` to use the UI.
 | Variable | Description | Required |
 |----------|-------------|----------|
 | `GOOGLE_API_KEY` | Google AI API key (free tier available) | Yes |
+| `VITE_API_URL` | Backend API URL (frontend only) | No* |
 
-Get your free API key at: https://aistudio.google.com/apikey
+*If not set, defaults to `https://soc1-management-review-generator.onrender.com/api`
+
+Get your free Google API key at: https://aistudio.google.com/apikey
+
+## Deployment
+
+### Backend Deployment (Render)
+
+1. Push your code to GitHub
+2. Go to [render.com](https://render.com) and sign in with GitHub
+3. Create a new Web Service:
+   - Select your repository
+   - Set **Root Directory**: `backend`
+   - **Runtime**: Python 3.11
+   - **Build Command**: `pip install -r requirements.txt`
+   - **Start Command**: `uvicorn main:app --host 0.0.0.0 --port 8000`
+4. Add environment variable in Settings:
+   - `GOOGLE_API_KEY`: Your free API key from https://aistudio.google.com/apikey
+5. Deploy! Render will provide a URL like `https://your-app.onrender.com`
+
+**Note**: Render free tier spins down after 15 minutes of inactivity. Upgrade to paid tier for 24/7 availability.
+
+### Frontend Deployment (Vercel)
+
+1. Go to [vercel.com](https://vercel.com) and sign in with GitHub
+2. Import your repository
+3. Configure:
+   - **Framework**: Vite
+   - **Root Directory**: `frontend`
+   - **Build Command**: `npm run build`
+   - **Output Directory**: `dist`
+4. Add environment variable:
+   - `VITE_API_URL`: `https://your-backend.onrender.com/api` (from Render deployment)
+5. Deploy!
+
+### CORS Configuration
+
+The backend CORS is configured to accept requests from:
+- `http://localhost:5173` (local development)
+- `https://soc1-agent.vercel.app/` (production)
+
+To update for your frontend domain, edit `backend/main.py` line 20 and add your frontend URL to the `allow_origins` list:
+
+```python
+allow_origins=[
+    "http://localhost:5173", 
+    "https://your-frontend-domain.vercel.app"
+]
+```
 
 ## Programmatic Usage
 
