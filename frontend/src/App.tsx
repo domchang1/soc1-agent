@@ -16,8 +16,14 @@ type JobStatus = {
   analysis_summary?: {
     total_controls: string | number;
     exceptions: string | number;
+    total_cuecs: string | number;
+    cells_needing_review?: {
+      low_confidence: number;
+      medium_confidence: number;
+    };
     summary: string;
     key_findings: string[];
+    cuec_findings?: string[];
   };
 };
 
@@ -56,8 +62,10 @@ export default function App() {
             "",
             "The AI agent is:",
             "• Extracting text and tables from the PDF",
-            "• Analyzing the SOC1 Management Review report content",
-            "• Mapping controls to the Excel template",
+            "• Analyzing the SOC1 Type II report content",
+            "• Mapping controls to '1.0 Management Review' sheet",
+            "• Extracting Complementary User Entity Controls (CUECs)",
+            "• Assessing confidence levels for each cell",
             "",
             "This may take 1-2 minutes depending on document size.",
           ].join("\n")
@@ -71,11 +79,24 @@ export default function App() {
         const outputLines = [
           "✓ Processing Complete!",
           "",
-          "Analysis Summary:",
-          `• Total Controls Identified: ${summary?.total_controls ?? "N/A"}`,
-          `• Controls with Exceptions: ${summary?.exceptions ?? "N/A"}`,
+          "═══ Analysis Summary ═══",
+          "",
+          "Controls:",
+          `  • Total Controls Identified: ${summary?.total_controls ?? "N/A"}`,
+          `  • Controls with Exceptions: ${summary?.exceptions ?? "N/A"}`,
+          "",
+          "Complementary User Entity Controls (CUECs):",
+          `  • Total CUECs Identified: ${summary?.total_cuecs ?? "N/A"}`,
           "",
         ];
+
+        // Add confidence review info
+        if (summary?.cells_needing_review) {
+          outputLines.push("Cells Needing Review:");
+          outputLines.push(`  • Low confidence (red): ${summary.cells_needing_review.low_confidence ?? 0}`);
+          outputLines.push(`  • Medium confidence (yellow): ${summary.cells_needing_review.medium_confidence ?? 0}`);
+          outputLines.push("");
+        }
 
         if (summary?.summary) {
           outputLines.push("Summary:", summary.summary, "");
@@ -89,6 +110,19 @@ export default function App() {
           outputLines.push("");
         }
 
+        if (summary?.cuec_findings && summary.cuec_findings.length > 0) {
+          outputLines.push("CUEC Findings:");
+          summary.cuec_findings.forEach((finding, i) => {
+            outputLines.push(`  ${i + 1}. ${finding}`);
+          });
+          outputLines.push("");
+        }
+
+        outputLines.push("═══ Color Legend ═══");
+        outputLines.push("  • No color: High confidence (info found in PDF)");
+        outputLines.push("  • Yellow: Medium confidence (partial/inferred info)");
+        outputLines.push("  • Red: Low confidence (info not found)");
+        outputLines.push("");
         outputLines.push("Click 'Download Result' to get the filled Excel file.");
 
         setOutput(outputLines.join("\n"));

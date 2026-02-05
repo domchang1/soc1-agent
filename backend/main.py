@@ -154,8 +154,14 @@ def get_status(job_id: str) -> dict[str, Any]:
         status["analysis_summary"] = {
             "total_controls": analysis.get("total_controls_identified", "N/A"),
             "exceptions": analysis.get("controls_with_exceptions", "N/A"),
+            "total_cuecs": analysis.get("total_cuecs_identified", "N/A"),
+            "cells_needing_review": analysis.get("cells_needing_review", {
+                "low_confidence": 0,
+                "medium_confidence": 0,
+            }),
             "summary": analysis.get("summary", ""),
             "key_findings": analysis.get("key_findings", [])[:5],
+            "cuec_findings": analysis.get("cuec_findings", [])[:5],
         }
 
     return status

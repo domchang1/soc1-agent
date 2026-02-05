@@ -21,6 +21,12 @@ import google.generativeai as genai
 import openpyxl
 import pdfplumber
 from dotenv import load_dotenv
+from openpyxl.styles import PatternFill
+
+# Confidence level color fills
+FILL_HIGH_CONFIDENCE = None  # No fill - confident
+FILL_MEDIUM_CONFIDENCE = PatternFill(start_color="FFFFCC", end_color="FFFFCC", fill_type="solid")  # Light yellow
+FILL_LOW_CONFIDENCE = PatternFill(start_color="FFCCCC", end_color="FFCCCC", fill_type="solid")  # Light red
 
 load_dotenv()
 
@@ -184,7 +190,7 @@ class ExcelHandler:
         output_path: Path,
     ) -> Path:
         """
-        Fill the Excel template with mapped data.
+        Fill the Excel template with mapped data and apply confidence-based coloring.
 
         Args:
             wb: The workbook to fill
@@ -194,12 +200,42 @@ class ExcelHandler:
 
         Returns:
             Path to the saved file
+
+        Color coding based on confidence:
+            - High confidence: No background color (default)
+            - Medium confidence: Light yellow background
+            - Low confidence: Light red background (missing info)
         """
         for sheet_name, rows in mappings.items():
-            if sheet_name not in wb.sheetnames:
+            # Find matching sheet (exact or fuzzy match)
+            actual_sheet_name = None
+            if sheet_name in wb.sheetnames:
+                actual_sheet_name = sheet_name
+            else:
+                # Try fuzzy matching for common variations
+                sheet_name_lower = sheet_name.lower()
+                for ws_name in wb.sheetnames:
+                    if sheet_name_lower in ws_name.lower() or ws_name.lower() in sheet_name_lower:
+                        actual_sheet_name = ws_name
+                        break
+                    # Also try matching key parts like "management review" or "user entity"
+                    if "management review" in sheet_name_lower and "management review" in ws_name.lower():
+                        actual_sheet_name = ws_name
+                        break
+                    if "user entity" in sheet_name_lower and "user entity" in ws_name.lower():
+                        actual_sheet_name = ws_name
+                        break
+                    if "cuec" in sheet_name_lower and "cuec" in ws_name.lower():
+                        actual_sheet_name = ws_name
+                        break
+
+            if actual_sheet_name is None:
+                print(f"Warning: Sheet '{sheet_name}' not found in workbook. Available: {wb.sheetnames}")
                 continue
 
-            ws = wb[sheet_name]
+            ws = wb[actual_sheet_name]
+            # Use the actual sheet name for header lookup
+            sheet_name = actual_sheet_name
             header_map = template.header_to_col.get(sheet_name, {})
             header_row = template.header_row.get(sheet_name, 1)
 
@@ -212,22 +248,49 @@ class ExcelHandler:
                 if row_idx <= header_row:
                     row_idx = header_row + 1
 
+                # Get confidence levels for this row (if provided)
+                confidence_map = row_update.get("_confidence", {})
+
                 for col_name, value in row_update.items():
                     if col_name.startswith("_"):
                         continue
 
-                    # Skip if value is a dict (metadata) or None
-                    if isinstance(value, dict) or value is None:
+                    # Handle value with embedded confidence
+                    cell_value = value
+                    cell_confidence = confidence_map.get(col_name, "high")
+
+                    # If value is a dict with value and confidence
+                    if isinstance(value, dict):
+                        cell_value = value.get("value")
+                        cell_confidence = value.get("confidence", "high")
+
+                    # Skip if no value
+                    if cell_value is None:
                         continue
 
                     # Find the column index for this header
-                    # Try exact match first, then normalized match
                     col_idx = header_map.get(col_name)
                     if col_idx is None:
                         col_idx = header_map.get(col_name.lower().strip())
 
                     if col_idx:
-                        ws.cell(row=row_idx, column=col_idx, value=value)
+                        cell = ws.cell(row=row_idx, column=col_idx, value=cell_value)
+
+                        # Apply confidence-based coloring
+                        if cell_confidence == "low":
+                            cell.fill = FILL_LOW_CONFIDENCE
+                        elif cell_confidence == "medium":
+                            cell.fill = FILL_MEDIUM_CONFIDENCE
+                        # High confidence = no fill (keep default)
+
+                # Apply row-level confidence coloring for empty/missing cells
+                row_confidence = row_update.get("_row_confidence", "high")
+                if row_confidence == "low":
+                    # Color all cells in the row that weren't filled
+                    for col_idx in range(1, len(template.headers.get(sheet_name, [])) + 1):
+                        cell = ws.cell(row=row_idx, column=col_idx)
+                        if cell.value is None:
+                            cell.fill = FILL_LOW_CONFIDENCE
 
         wb.save(output_path)
         return output_path
@@ -326,7 +389,9 @@ class SOC1Agent:
         return f"""You are an expert at analyzing SOC1 Type II audit reports and extracting relevant information to fill management review templates.
 
 ## Task
-Analyze the following SOC1 Type II report content and extract information to fill the management review Excel template.
+Analyze the following SOC1 Type II report content and extract information to fill the management review Excel template. You must fill out TWO sections:
+1. "1.0 Management Review" - Controls and test results
+2. "2.0.b Complimentary User Entity Controls" - CUECs from the report
 
 ## Excel Template Structure
 {template_info}
@@ -336,53 +401,71 @@ Analyze the following SOC1 Type II report content and extract information to fil
 {tables_info}
 
 ## Instructions
-1. Analyze the SOC1 Type II report to identify:
-   - Control objectives
-   - Control activities/descriptions
-   - Testing procedures performed
-   - Test results (effective/exception)
-   - Any exceptions or deviations noted
-   - Management responses (if any)
-   - Auditor conclusions
 
-2. Map the extracted information to the Excel template columns. Use the EXACT column names from the template.
+### CONFIDENCE LEVELS (CRITICAL)
+For EACH cell value, you must indicate your confidence level:
+- "high": You found clear, explicit information in the PDF for this field
+- "medium": You found some related information but had to infer or the info is incomplete
+- "low": You could not find information for this field (leave value empty or provide best guess)
 
-3. Return a JSON object with the following structure:
+### Return Format
+Return a JSON object with this structure:
 {{
-    "Sheet Name": [
+    "1.0 Management Review": [
         {{
-            "_row": <row_number starting from 2>,
-            "Exact Column Name 1": "value to fill",
-            "Exact Column Name 2": "value to fill",
+            "_row": 2,
+            "_row_confidence": "high",
+            "Column Name": {{"value": "the value", "confidence": "high"}},
+            "Another Column": {{"value": "partial info", "confidence": "medium"}},
+            "Missing Column": {{"value": "", "confidence": "low"}},
+            ...
+        }},
+        ...
+    ],
+    "2.0.b Complimentary User Entity Controls": [
+        {{
+            "_row": 2,
+            "_row_confidence": "high",
+            "Column Name": {{"value": "CUEC description", "confidence": "high"}},
             ...
         }},
         ...
     ]
 }}
 
-IMPORTANT:
-- Use the EXACT sheet names and column names from the template (case-sensitive)
-- Row numbers should start from 2 (row 1 is headers)
-- Create one entry per control/finding identified in the report
+### Section 1: Management Review
+Extract from the SOC1 report:
+- Control ID/Number
+- Control Description/Objective
+- Control Owner/Responsible Party
+- Test Procedure Performed
+- Sample Size
+- Test Result (Effective/Exception/N/A)
+- Exception Details (if any)
+- Management Response
+- Remediation Status
+- Auditor conclusions
 
-4. For each piece of information:
-   - Be accurate and faithful to the source document
-   - Use direct quotes where appropriate for descriptions and findings
-   - If information is not found for a column, omit that column from the row
-   - Match the format/style of any existing data in the template
+### Section 2: Complementary User Entity Controls (CUECs)
+Look for sections in the PDF titled:
+- "Complementary User Entity Controls"
+- "User Entity Controls"
+- "User Control Considerations"
+- "CUECs"
 
-5. Focus on extracting these typical SOC1 management review elements:
-   - Control ID/Number
-   - Control Description/Objective
-   - Control Owner/Responsible Party
-   - Test Procedure Performed
-   - Sample Size
-   - Test Result (Effective/Exception/N/A)
-   - Exception Details (if any)
-   - Management Response
-   - Remediation Status
-   - Review Date
-   - Reviewer Comments/Notes
+CUECs are controls that user organizations (clients) are expected to implement. Extract:
+- CUEC ID/Reference number
+- CUEC Description
+- Related control objective
+- Any implementation guidance
+
+### IMPORTANT RULES
+1. Use EXACT sheet names and column names from the template (case-sensitive)
+2. Row numbers start from 2 (row 1 is headers)
+3. Create one entry per control/CUEC identified
+4. If a sheet doesn't exist in the template, skip it
+5. If you cannot find CUECs section, return an empty array for that sheet
+6. ALWAYS include confidence for each value
 
 Return ONLY the JSON object, no additional text or markdown formatting."""
 
@@ -433,13 +516,21 @@ Return ONLY the JSON object, no additional text or markdown formatting."""
 2. Flag any exceptions or findings that need management attention
 3. Note any missing information that should be followed up on
 4. Provide a summary of the overall control environment
+5. Count cells marked with low/medium confidence that need review
+6. Analyze the Complementary User Entity Controls (CUECs) extraction
 
 Return a JSON object:
 {{
     "total_controls_identified": <number>,
     "controls_with_exceptions": <number>,
+    "total_cuecs_identified": <number>,
+    "cells_needing_review": {{
+        "low_confidence": <number of cells with low confidence>,
+        "medium_confidence": <number of cells with medium confidence>
+    }},
     "missing_information": ["list of missing items"],
     "key_findings": ["list of key findings"],
+    "cuec_findings": ["list of findings related to CUECs"],
     "recommendations": ["list of recommendations"],
     "summary": "brief summary of the SOC1 report"
 }}
