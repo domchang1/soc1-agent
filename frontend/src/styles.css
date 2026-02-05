@@ -294,12 +294,13 @@ input[type="file"]:disabled::file-selector-button {
 }
 
 .output-findings {
-  background: rgba(255, 255, 255, 0.05);
+  background: rgba(255, 255, 255, 0.08);
   border-left: 3px solid #3b82f6;
   border-radius: 6px;
   padding: 12px 14px;
   margin: 8px 0;
   font-size: 0.9rem;
+  color: #e2e8f0;
 }
 
 .output-findings.cuec {
@@ -309,21 +310,24 @@ input[type="file"]:disabled::file-selector-button {
 .output-findings li {
   margin: 6px 0;
   margin-left: 16px;
+  color: #e2e8f0;
 }
 
 .output-legend {
-  background: rgba(255, 255, 255, 0.03);
+  background: rgba(255, 255, 255, 0.08);
   border-radius: 8px;
   padding: 12px 14px;
   font-size: 0.85rem;
   display: grid;
   gap: 6px;
+  color: #e2e8f0;
 }
 
 .legend-item {
   display: flex;
   align-items: center;
   gap: 8px;
+  color: #e2e8f0;
 }
 
 .legend-color {
