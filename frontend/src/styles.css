@@ -359,3 +359,166 @@ input[type="file"]:disabled::file-selector-button {
   color: #b91c1c;
   font-weight: 600;
 }
+
+/* Feedback Section */
+.feedback-card {
+  border: 2px solid #3b82f6;
+  background: linear-gradient(135deg, #eff6ff 0%, #dbeafe 100%);
+  animation: slideIn 0.3s ease-out;
+}
+
+@keyframes slideIn {
+  from {
+    opacity: 0;
+    transform: translateY(20px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+.feedback-card h3 {
+  margin: 0 0 8px 0;
+  color: #1e40af;
+}
+
+.feedback-card > p {
+  margin: 0 0 20px 0;
+  color: #475569;
+}
+
+.feedback-rating {
+  margin-bottom: 20px;
+}
+
+.feedback-rating label {
+  display: block;
+  margin-bottom: 8px;
+  color: #1e293b;
+}
+
+.stars {
+  display: flex;
+  gap: 8px;
+}
+
+.star {
+  background: none;
+  border: none;
+  font-size: 2rem;
+  color: #cbd5e1;
+  cursor: pointer;
+  padding: 0;
+  transition: color 0.2s ease, transform 0.2s ease;
+}
+
+.star:hover,
+.star.filled {
+  color: #fbbf24;
+  transform: scale(1.1);
+}
+
+.feedback-issues {
+  margin-bottom: 20px;
+}
+
+.feedback-issues > label {
+  display: block;
+  margin-bottom: 12px;
+  color: #1e293b;
+}
+
+.issue-checkboxes {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+  gap: 10px;
+}
+
+.checkbox-label {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-weight: 500;
+  color: #475569;
+  cursor: pointer;
+  padding: 8px 12px;
+  border-radius: 8px;
+  background: white;
+  border: 1px solid #e2e8f0;
+  transition: background 0.2s ease, border-color 0.2s ease;
+}
+
+.checkbox-label:hover {
+  background: #f8fafc;
+  border-color: #3b82f6;
+}
+
+.checkbox-label input[type="checkbox"] {
+  cursor: pointer;
+  width: 18px;
+  height: 18px;
+  accent-color: #3b82f6;
+}
+
+.feedback-text {
+  margin-bottom: 20px;
+}
+
+.feedback-text label {
+  display: block;
+  margin-bottom: 8px;
+  color: #1e293b;
+}
+
+.feedback-text textarea {
+  width: 100%;
+  padding: 12px 16px;
+  border: 1px solid #cbd5e1;
+  border-radius: 12px;
+  font-family: "Inter", system-ui, sans-serif;
+  font-size: 0.95rem;
+  resize: vertical;
+  background: white;
+  color: #0f172a;
+  transition: border-color 0.2s ease;
+}
+
+.feedback-text textarea:focus {
+  outline: none;
+  border-color: #3b82f6;
+  box-shadow: 0 0 0 3px rgba(59, 130, 246, 0.1);
+}
+
+.feedback-actions {
+  display: flex;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+.submit-feedback {
+  background: #3b82f6;
+}
+
+.submit-feedback:hover:not(:disabled) {
+  background: #2563eb;
+  box-shadow: 0 8px 20px rgba(59, 130, 246, 0.3);
+}
+
+.feedback-success {
+  border: 2px solid #10b981;
+  background: linear-gradient(135deg, #ecfdf5 0%, #d1fae5 100%);
+  text-align: center;
+  animation: slideIn 0.3s ease-out;
+}
+
+.feedback-success h3 {
+  margin: 0 0 8px 0;
+  color: #047857;
+  font-size: 1.5rem;
+}
+
+.feedback-success p {
+  margin: 0;
+  color: #065f46;
+}

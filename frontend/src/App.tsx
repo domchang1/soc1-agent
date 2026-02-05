@@ -40,6 +40,11 @@ export default function App() {
   const [isProcessing, setIsProcessing] = useState(false);
   const [jobId, setJobId] = useState<string | null>(null);
   const [canDownload, setCanDownload] = useState(false);
+  const [showFeedback, setShowFeedback] = useState(false);
+  const [feedbackRating, setFeedbackRating] = useState(0);
+  const [feedbackText, setFeedbackText] = useState("");
+  const [feedbackIssues, setFeedbackIssues] = useState<string[]>([]);
+  const [feedbackSubmitted, setFeedbackSubmitted] = useState(false);
   const pollingRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
   const canSubmit = useMemo(
@@ -281,6 +286,44 @@ ${summary?.cuec_findings && summary.cuec_findings.length > 0 ? `
   const handleDownload = () => {
     if (!jobId) return;
     window.open(`${API_BASE}/download/${jobId}`, "_blank");
+    // Show feedback form after download
+    setTimeout(() => setShowFeedback(true), 1000);
+  };
+
+  const handleFeedbackSubmit = async () => {
+    if (!jobId || feedbackRating === 0) {
+      alert("Please provide a rating before submitting.");
+      return;
+    }
+
+    try {
+      const formData = new FormData();
+      formData.append("rating", feedbackRating.toString());
+      formData.append("feedback_text", feedbackText);
+      feedbackIssues.forEach((issue) => formData.append("issues", issue));
+
+      const response = await fetch(`${API_BASE}/feedback/${jobId}`, {
+        method: "POST",
+        body: formData,
+      });
+
+      if (response.ok) {
+        setFeedbackSubmitted(true);
+        setTimeout(() => {
+          setShowFeedback(false);
+          setFeedbackSubmitted(false);
+        }, 2000);
+      }
+    } catch (err) {
+      console.error("Failed to submit feedback:", err);
+      alert("Failed to submit feedback. Please try again.");
+    }
+  };
+
+  const toggleIssue = (issue: string) => {
+    setFeedbackIssues((prev) =>
+      prev.includes(issue) ? prev.filter((i) => i !== issue) : [...prev, issue]
+    );
   };
 
   const handleReset = () => {
@@ -294,6 +337,11 @@ ${summary?.cuec_findings && summary.cuec_findings.length > 0 ? `
     setIsProcessing(false);
     setJobId(null);
     setCanDownload(false);
+    setShowFeedback(false);
+    setFeedbackRating(0);
+    setFeedbackText("");
+    setFeedbackIssues([]);
+    setFeedbackSubmitted(false);
 
     if (pollingRef.current) {
       clearInterval(pollingRef.current);
@@ -387,6 +435,78 @@ ${summary?.cuec_findings && summary.cuec_findings.length > 0 ? `
           )}
         </div>
       </section>
+
+      {showFeedback && !feedbackSubmitted && (
+        <section className="card feedback-card">
+          <h3>Help Us Improve</h3>
+          <p>How accurate was the extraction? Your feedback helps us improve the AI.</p>
+          
+          <div className="feedback-rating">
+            <label>Rating:</label>
+            <div className="stars">
+              {[1, 2, 3, 4, 5].map((star) => (
+                <button
+                  key={star}
+                  type="button"
+                  className={`star ${feedbackRating >= star ? "filled" : ""}`}
+                  onClick={() => setFeedbackRating(star)}
+                >
+                  ★
+                </button>
+              ))}
+            </div>
+          </div>
+
+          <div className="feedback-issues">
+            <label>What issues did you encounter? (optional)</label>
+            <div className="issue-checkboxes">
+              {[
+                { id: "missing_controls", label: "Missing controls" },
+                { id: "incorrect_mapping", label: "Incorrect field mapping" },
+                { id: "low_confidence", label: "Too many low confidence cells" },
+                { id: "missing_cuecs", label: "Missing CUECs" },
+                { id: "formatting", label: "Formatting issues" },
+                { id: "other", label: "Other" },
+              ].map((issue) => (
+                <label key={issue.id} className="checkbox-label">
+                  <input
+                    type="checkbox"
+                    checked={feedbackIssues.includes(issue.id)}
+                    onChange={() => toggleIssue(issue.id)}
+                  />
+                  {issue.label}
+                </label>
+              ))}
+            </div>
+          </div>
+
+          <div className="feedback-text">
+            <label>Additional comments (optional):</label>
+            <textarea
+              value={feedbackText}
+              onChange={(e) => setFeedbackText(e.target.value)}
+              placeholder="Tell us more about your experience..."
+              rows={3}
+            />
+          </div>
+
+          <div className="feedback-actions">
+            <button type="button" onClick={handleFeedbackSubmit} className="submit-feedback">
+              Submit Feedback
+            </button>
+            <button type="button" onClick={() => setShowFeedback(false)} className="secondary">
+              Skip
+            </button>
+          </div>
+        </section>
+      )}
+
+      {feedbackSubmitted && (
+        <section className="card feedback-success">
+          <h3>✓ Thank you!</h3>
+          <p>Your feedback has been submitted and will help improve future extractions.</p>
+        </section>
+      )}
     </div>
   );
 }

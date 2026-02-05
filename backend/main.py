@@ -217,6 +217,115 @@ def download_result(job_id: str):
     )
 
 
+@app.post("/api/feedback/{job_id}")
+async def submit_feedback(
+    job_id: str,
+    rating: int,
+    feedback_text: str = "",
+    issues: list[str] = [],
+    corrected_file: UploadFile = File(None),
+) -> dict[str, Any]:
+    """
+    Submit feedback for a completed job.
+    
+    Args:
+        job_id: The job ID to provide feedback for
+        rating: 1-5 star rating
+        feedback_text: Optional detailed feedback text
+        issues: List of issue categories (e.g., "missing_controls", "incorrect_mapping")
+        corrected_file: Optional corrected Excel file for training data
+    """
+    if job_id not in job_status:
+        return {"error": "Job not found"}
+    
+    feedback_dir = Path("feedback")
+    feedback_dir.mkdir(exist_ok=True)
+    
+    # Store feedback metadata
+    feedback_data = {
+        "job_id": job_id,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "rating": rating,
+        "feedback_text": feedback_text,
+        "issues": issues,
+        "job_metadata": {
+            "type_ii_report": job_status[job_id].get("type_ii_report"),
+            "management_review": job_status[job_id].get("management_review"),
+            "analysis_summary": job_status[job_id].get("analysis_summary"),
+        },
+    }
+    
+    # Save corrected file if provided
+    if corrected_file:
+        corrected_path = feedback_dir / f"{job_id}_corrected.xlsx"
+        corrected_bytes = await corrected_file.read()
+        corrected_path.write_bytes(corrected_bytes)
+        feedback_data["corrected_file"] = str(corrected_path)
+    
+    # Append feedback to JSON log
+    feedback_log = feedback_dir / "feedback_log.json"
+    import json
+    
+    if feedback_log.exists():
+        with open(feedback_log, "r") as f:
+            all_feedback = json.load(f)
+    else:
+        all_feedback = []
+    
+    all_feedback.append(feedback_data)
+    
+    with open(feedback_log, "w") as f:
+        json.dump(all_feedback, f, indent=2)
+    
+    return {
+        "status": "success",
+        "message": "Thank you for your feedback! This helps us improve the extraction quality.",
+        "feedback_id": f"{job_id}_{len(all_feedback)}",
+    }
+
+
+@app.get("/api/feedback/stats")
+def get_feedback_stats() -> dict[str, Any]:
+    """Get aggregated feedback statistics (for admin/monitoring)."""
+    feedback_dir = Path("feedback")
+    feedback_log = feedback_dir / "feedback_log.json"
+    
+    if not feedback_log.exists():
+        return {
+            "total_feedback": 0,
+            "average_rating": 0,
+            "common_issues": {},
+        }
+    
+    import json
+    with open(feedback_log, "r") as f:
+        all_feedback = json.load(f)
+    
+    if not all_feedback:
+        return {
+            "total_feedback": 0,
+            "average_rating": 0,
+            "common_issues": {},
+        }
+    
+    # Calculate statistics
+    total = len(all_feedback)
+    avg_rating = sum(f["rating"] for f in all_feedback) / total
+    
+    # Count issue frequencies
+    issue_counts: dict[str, int] = {}
+    for feedback in all_feedback:
+        for issue in feedback.get("issues", []):
+            issue_counts[issue] = issue_counts.get(issue, 0) + 1
+    
+    return {
+        "total_feedback": total,
+        "average_rating": round(avg_rating, 2),
+        "common_issues": issue_counts,
+        "recent_feedback": all_feedback[-5:],  # Last 5 feedback entries
+    }
+
+
 @app.post("/api/cleanup-uploads")
 def cleanup_uploads() -> dict[str, Any]:
     """Manually clear all files in the uploads folder."""

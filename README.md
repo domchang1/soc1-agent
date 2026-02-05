@@ -8,6 +8,7 @@ AI-powered tool for processing SOC1 Type II audit reports and automatically fill
 - **AI-Powered Mapping**: Uses Google Gemini AI (free tier) to intelligently map extracted content to Excel template fields
 - **Excel Generation**: Automatically fills management review templates with extracted data
 - **Gap Analysis**: Analyzes the extraction for completeness and provides recommendations
+- **User Feedback System**: Collects user feedback to help you continuously improve extraction quality
 
 ## Prerequisites
 
@@ -65,6 +66,8 @@ Open `http://localhost:5173` to use the UI.
   - Returns: `job_id` for status polling
 - `GET /api/status/{job_id}` - Check processing status and get analysis summary
 - `GET /api/download/{job_id}` - Download the filled Excel file
+- `POST /api/feedback/{job_id}` - Submit user feedback on extraction quality
+- `GET /api/feedback/stats` - Get aggregated feedback statistics (admin)
 - `POST /api/cleanup-uploads` - Clear temporary upload files (maintenance)
 
 ## Architecture
@@ -153,6 +156,29 @@ allow_origins=[
     "https://your-frontend-domain.vercel.app"
 ]
 ```
+
+## User Feedback System
+
+After downloading results, users can optionally provide feedback (star rating, issue categories, comments). This helps you identify and fix common extraction issues.
+
+**Analyze feedback:**
+```bash
+cd backend
+python analyze_feedback.py              # View summary statistics
+python analyze_feedback.py --detailed   # See all feedback entries
+python analyze_feedback.py --export     # Export to CSV
+```
+
+**Feedback data stored in:**
+- `backend/feedback/feedback_log.json` - All feedback entries
+- `backend/feedback/{job_id}_corrected.xlsx` - User-corrected files (when provided)
+
+**Use feedback to improve:**
+1. Run analysis tool to identify common issues
+2. Review corrected files to see what the AI missed
+3. Update AI prompts in `agent.py` with better instructions/examples
+4. Test with previous problem cases
+5. Deploy improvements
 
 ## Programmatic Usage
 
