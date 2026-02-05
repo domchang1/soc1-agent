@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import io
 import os
 import traceback
 from datetime import datetime, timezone
@@ -8,7 +9,7 @@ from typing import Any
 
 from fastapi import FastAPI, File, UploadFile, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
+from fastapi.responses import StreamingResponse
 
 from agent import process_soc1_documents
 
@@ -23,7 +24,9 @@ app.add_middleware(
 )
 
 # In-memory job status storage (use Redis/DB in production)
+# Store both metadata and the generated Excel file bytes in memory
 job_status: dict[str, dict[str, Any]] = {}
+job_files: dict[str, bytes] = {}  # Store generated Excel files in memory
 
 
 @app.get("/api/health")
@@ -31,24 +34,41 @@ def health() -> dict[str, str]:
     return {"status": "ok"}
 
 
-async def process_job(job_id: str, type_ii_path: Path, management_path: Path, output_dir: Path):
+async def process_job(job_id: str, type_ii_path: Path, management_path: Path):
     """Background task to process the SOC1 documents."""
     try:
         job_status[job_id]["status"] = "processing"
         job_status[job_id]["message"] = "Extracting PDF content and mapping to Excel template..."
 
+        # Use a temporary directory for the processing pipeline
+        import tempfile
+        temp_dir = tempfile.mkdtemp()
+
         result = await process_soc1_documents(
             type_ii_path=type_ii_path,
             management_review_path=management_path,
-            output_dir=output_dir,
+            output_dir=Path(temp_dir),
         )
+
+        # Read the generated Excel file into memory
+        output_path = Path(result["output_path"])
+        if output_path.exists():
+            file_bytes = output_path.read_bytes()
+            job_files[job_id] = file_bytes
+            output_filename = output_path.name
+        else:
+            raise FileNotFoundError(f"Generated file not found: {output_path}")
 
         job_status[job_id].update({
             "status": "completed",
             "message": "SOC 1 management review generated successfully.",
             "result": result,
-            "output_path": result["output_path"],
+            "output_filename": output_filename,
         })
+
+        # Clean up temporary files after reading
+        import shutil
+        shutil.rmtree(temp_dir, ignore_errors=True)
 
     except Exception as e:
         job_status[job_id].update({
@@ -65,9 +85,7 @@ async def upload(
     management_review: UploadFile = File(...),
 ) -> dict[str, Any]:
     upload_root = Path("uploads")
-    output_root = Path("outputs")
     upload_root.mkdir(parents=True, exist_ok=True)
-    output_root.mkdir(parents=True, exist_ok=True)
 
     timestamp = datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")
     job_id = f"job-{timestamp}"
@@ -119,7 +137,6 @@ async def upload(
         job_id,
         type_ii_path,
         management_path,
-        output_root,
     )
 
     return {
@@ -169,7 +186,7 @@ def get_status(job_id: str) -> dict[str, Any]:
 
 @app.get("/api/download/{job_id}")
 def download_result(job_id: str):
-    """Download the generated Excel file."""
+    """Download the generated Excel file from memory."""
     if job_id not in job_status:
         return {"error": "Job not found"}
 
@@ -177,12 +194,15 @@ def download_result(job_id: str):
     if status.get("status") != "completed":
         return {"error": "Job not completed yet", "status": status.get("status")}
 
-    output_path = status.get("output_path")
-    if not output_path or not Path(output_path).exists():
-        return {"error": "Output file not found"}
+    if job_id not in job_files:
+        return {"error": "Generated file not found in memory"}
 
-    return FileResponse(
-        path=output_path,
-        filename=Path(output_path).name,
+    file_bytes = job_files[job_id]
+    filename = status.get("output_filename", "soc1_management_review.xlsx")
+
+    # Return the file as a streaming response
+    return StreamingResponse(
+        io.BytesIO(file_bytes),
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": f"attachment; filename={filename}"},
     )
