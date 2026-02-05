@@ -56,6 +56,14 @@ class ExcelTemplate:
     header_to_col: dict[str, dict[str, int]]  # sheet_name -> {header: col_index}
     header_row: dict[str, int]  # sheet_name -> header row number
     structure: dict[str, list[dict[str, Any]]]  # sheet_name -> list of row dicts
+    sheet_type: dict[str, str] = None  # sheet_name -> "form" or "table"
+    form_fields: dict[str, list[dict[str, Any]]] = None  # sheet_name -> list of form fields
+    
+    def __post_init__(self):
+        if self.sheet_type is None:
+            self.sheet_type = {}
+        if self.form_fields is None:
+            self.form_fields = {}
 
 
 class PDFExtractor:
@@ -114,6 +122,7 @@ class ExcelHandler:
     def read_template(excel_path: Path) -> tuple[openpyxl.Workbook, ExcelTemplate]:
         """
         Read an Excel template and extract its structure.
+        Detects whether each sheet is a "form" (questionnaire) or "table" (tabular data).
 
         Args:
             excel_path: Path to the Excel file
@@ -127,50 +136,108 @@ class ExcelHandler:
         header_to_col: dict[str, dict[str, int]] = {}
         header_rows: dict[str, int] = {}
         structure: dict[str, list[dict[str, Any]]] = {}
+        sheet_types: dict[str, str] = {}
+        form_fields: dict[str, list[dict[str, Any]]] = {}
 
         for sheet_name in sheet_names:
             ws = wb[sheet_name]
             sheet_headers: list[str] = []
             sheet_header_to_col: dict[str, int] = {}
             sheet_structure: list[dict[str, Any]] = []
+            sheet_form_fields: list[dict[str, Any]] = []
 
-            # Find headers (assume first row with content)
-            found_header_row = 1
-            for row_idx in range(1, min(10, ws.max_row + 1)):  # Check first 10 rows
-                row_values = [
-                    ws.cell(row=row_idx, column=col).value
-                    for col in range(1, ws.max_column + 1)
-                ]
-                non_empty = [v for v in row_values if v is not None]
-                if len(non_empty) >= 2:  # Found a row with multiple values
-                    found_header_row = row_idx
-                    for col_idx, v in enumerate(row_values, 1):
-                        header_name = str(v) if v else f"Column_{col_idx}"
-                        sheet_headers.append(header_name)
-                        # Map both original and normalized (lowercase, stripped) header names
-                        sheet_header_to_col[header_name] = col_idx
-                        sheet_header_to_col[header_name.lower().strip()] = col_idx
-                    break
+            # Analyze sheet structure to determine if it's a form or table
+            # Count how many rows have content only in column A (form-like)
+            form_like_rows = 0
+            table_like_rows = 0
+            best_header_row = None
+            best_header_count = 0
+            
+            for row_idx in range(1, min(30, ws.max_row + 1)):
+                row_values = []
+                for col in range(1, min(15, ws.max_column + 1)):
+                    val = ws.cell(row=row_idx, column=col).value
+                    if val is not None:
+                        row_values.append((col, val))
+                
+                if len(row_values) == 1 and row_values[0][0] == 1:
+                    # Only column A has content - form-like
+                    form_like_rows += 1
+                elif len(row_values) >= 3:
+                    # Multiple columns have content - could be header row
+                    table_like_rows += 1
+                    if len(row_values) > best_header_count:
+                        best_header_count = len(row_values)
+                        best_header_row = row_idx
+
+            # Determine sheet type
+            is_form = form_like_rows > table_like_rows * 2
+            sheet_types[sheet_name] = "form" if is_form else "table"
+            
+            if is_form:
+                # Extract form fields from column A
+                for row_idx in range(1, min(100, ws.max_row + 1)):
+                    label = ws.cell(row=row_idx, column=1).value
+                    if label and isinstance(label, str) and len(label.strip()) > 0:
+                        # Check if this row has any existing data in other columns
+                        existing_values = {}
+                        for col in range(2, min(10, ws.max_column + 1)):
+                            val = ws.cell(row=row_idx, column=col).value
+                            if val is not None:
+                                existing_values[col] = val
+                        
+                        sheet_form_fields.append({
+                            "row": row_idx,
+                            "label": label.strip(),
+                            "answer_col": 2,  # Default answer column is B
+                            "existing": existing_values,
+                        })
+                
+                form_fields[sheet_name] = sheet_form_fields
+                # For forms, create pseudo-headers based on common answer columns
+                sheet_headers = ["Label", "Answer", "Notes", "Reference"]
+                for i, h in enumerate(sheet_headers, 1):
+                    sheet_header_to_col[h] = i
+                    sheet_header_to_col[h.lower()] = i
+                found_header_row = 1
+                
+            else:
+                # Table sheet - find the best header row
+                found_header_row = best_header_row or 1
+                
+                # Extract headers from the identified row
+                for col_idx in range(1, ws.max_column + 1):
+                    v = ws.cell(row=found_header_row, column=col_idx).value
+                    header_name = str(v).strip() if v else f"Column_{col_idx}"
+                    # Clean up header names (remove newlines, extra spaces)
+                    header_name = ' '.join(header_name.split())
+                    sheet_headers.append(header_name)
+                    sheet_header_to_col[header_name] = col_idx
+                    sheet_header_to_col[header_name.lower()] = col_idx
+                    # Also map without special characters for fuzzy matching
+                    clean_name = ''.join(c for c in header_name.lower() if c.isalnum() or c.isspace())
+                    sheet_header_to_col[clean_name] = col_idx
 
             headers[sheet_name] = sheet_headers
             header_to_col[sheet_name] = sheet_header_to_col
             header_rows[sheet_name] = found_header_row
 
             # Extract existing data structure (for context to AI)
-            for row_idx in range(found_header_row + 1, min(found_header_row + 100, ws.max_row + 1)):
-                row_data: dict[str, Any] = {"_row": row_idx}
-                has_data = False
-                for col_idx, header in enumerate(sheet_headers, 1):
-                    cell = ws.cell(row=row_idx, column=col_idx)
-                    row_data[header] = {
-                        "value": cell.value,
-                        "column": col_idx,
-                        "row": row_idx,
-                    }
-                    if cell.value is not None:
-                        has_data = True
-                if has_data:
-                    sheet_structure.append(row_data)
+            if not is_form:
+                for row_idx in range(found_header_row + 1, min(found_header_row + 100, ws.max_row + 1)):
+                    row_data: dict[str, Any] = {"_row": row_idx}
+                    has_data = False
+                    for col_idx, header in enumerate(sheet_headers, 1):
+                        cell = ws.cell(row=row_idx, column=col_idx)
+                        row_data[header] = {
+                            "value": cell.value,
+                            "column": col_idx,
+                            "row": row_idx,
+                        }
+                        if cell.value is not None:
+                            has_data = True
+                    if has_data:
+                        sheet_structure.append(row_data)
 
             structure[sheet_name] = sheet_structure
 
@@ -181,6 +248,8 @@ class ExcelHandler:
             header_to_col=header_to_col,
             header_row=header_rows,
             structure=structure,
+            sheet_type=sheet_types,
+            form_fields=form_fields,
         )
 
     @staticmethod
@@ -207,9 +276,18 @@ class ExcelHandler:
             - Medium confidence: Light yellow background
             - Low confidence: Light red background (missing info)
         """
-        print(f"fill_template called with {len(mappings)} sheets")
-        print(f"Available sheets in workbook: {wb.sheetnames}")
-        print(f"Mappings keys: {list(mappings.keys())}")
+        print(f"\n{'='*60}")
+        print(f"FILL_TEMPLATE DEBUG")
+        print(f"{'='*60}")
+        print(f"Sheets in workbook: {wb.sheetnames}")
+        print(f"Mappings received for sheets: {list(mappings.keys())}")
+        print(f"Sheet types: {template.sheet_type}")
+        
+        # Debug: Show what data we received
+        for sheet_name, rows in mappings.items():
+            print(f"\n--- Data for '{sheet_name}' ({len(rows)} rows) ---")
+            for i, row in enumerate(rows[:5]):  # Show first 5 rows
+                print(f"  Row {i}: {row}")
         
         for sheet_name, rows in mappings.items():
             # Find matching sheet (exact or fuzzy match)
@@ -238,88 +316,133 @@ class ExcelHandler:
                 print(f"Warning: Sheet '{sheet_name}' not found in workbook. Available: {wb.sheetnames}")
                 continue
 
-            print(f"Processing sheet '{sheet_name}' -> actual: '{actual_sheet_name}' with {len(rows)} rows")
+            print(f"\nProcessing sheet '{sheet_name}' -> actual: '{actual_sheet_name}' with {len(rows)} rows")
             ws = wb[actual_sheet_name]
             # Use the actual sheet name for header lookup
-            sheet_name = actual_sheet_name
-            header_map = template.header_to_col.get(sheet_name, {})
-            header_row = template.header_row.get(sheet_name, 1)
-            print(f"  Header row: {header_row}, columns: {len(header_map)}")
+            lookup_sheet_name = actual_sheet_name
+            header_map = template.header_to_col.get(lookup_sheet_name, {})
+            header_row = template.header_row.get(lookup_sheet_name, 1)
+            sheet_type = template.sheet_type.get(lookup_sheet_name, "table")
+            
+            print(f"  Sheet type: {sheet_type}")
+            print(f"  Header row: {header_row}")
+            print(f"  Header map keys: {list(header_map.keys())[:10]}...")
+            
+            # Normalize confidence values
+            def normalize_confidence(c):
+                if c in ("h", "high"):
+                    return "high"
+                elif c in ("m", "medium", "med"):
+                    return "medium"
+                elif c in ("l", "low"):
+                    return "low"
+                return "high"  # default
 
             for row_idx_in, row_update in enumerate(rows):
                 row_idx = row_update.get("_row")
                 if row_idx is None:
-                    print(f"    Row {row_idx_in}: No _row field, skipping")
+                    print(f"    Row {row_idx_in}: No _row field, skipping. Data: {row_update}")
                     continue
 
-                # Ensure row_idx is after header row
-                if row_idx <= header_row:
-                    row_idx = header_row + 1
-                
                 cells_written = 0
-
-                # Get confidence levels for this row (supports multiple formats)
-                # Format 1: "_confidence": {"col_name": "high", ...}
-                # Format 2: "_c": {"col_name": "h", ...} (abbreviated)
-                # Format 3: "col_name": {"value": "x", "confidence": "high"}
                 confidence_map = row_update.get("_confidence", row_update.get("_c", {}))
                 row_confidence = row_update.get("_row_confidence", "high")
                 
-                # Normalize abbreviated confidence values
-                def normalize_confidence(c):
-                    if c in ("h", "high"):
-                        return "high"
-                    elif c in ("m", "medium", "med"):
-                        return "medium"
-                    elif c in ("l", "low"):
-                        return "low"
-                    return "high"  # default
-
-                for col_name, value in row_update.items():
-                    if col_name.startswith("_"):
-                        continue
-
-                    # Handle value with embedded confidence
-                    cell_value = value
-                    raw_confidence = confidence_map.get(col_name, "high")
-                    cell_confidence = normalize_confidence(raw_confidence)
-
-                    if isinstance(value, dict):
-                        cell_value = value.get("value", value.get("v"))
-                        raw_conf = value.get("confidence", value.get("c", raw_confidence))
-                        cell_confidence = normalize_confidence(raw_conf)
-
-                    # Skip if no value or empty string
-                    if cell_value is None or cell_value == "":
-                        # Mark empty cells with low confidence
-                        col_idx = header_map.get(col_name) or header_map.get(col_name.lower().strip())
-                        if col_idx and confidence_map.get(col_name) == "low":
-                            cell = ws.cell(row=row_idx, column=col_idx)
-                            cell.fill = FILL_LOW_CONFIDENCE
-                        continue
-
-                    # Find the column index for this header
-                    col_idx = header_map.get(col_name)
-                    if col_idx is None:
-                        col_idx = header_map.get(col_name.lower().strip())
-
-                    if col_idx:
-                        cell = ws.cell(row=row_idx, column=col_idx, value=cell_value)
+                # Handle form-style sheets differently
+                if sheet_type == "form":
+                    # For form sheets, write the "Answer" to column B at the specified row
+                    answer = row_update.get("Answer") or row_update.get("answer")
+                    if answer:
+                        cell = ws.cell(row=row_idx, column=2, value=answer)
                         cells_written += 1
+                    # Also check for any other column data
+                    for col_name, value in row_update.items():
+                        if col_name.startswith("_") or col_name.lower() == "answer":
+                            continue
+                        if value and isinstance(value, str):
+                            # Try to map by column name
+                            col_idx = header_map.get(col_name) or header_map.get(col_name.lower())
+                            if col_idx:
+                                ws.cell(row=row_idx, column=col_idx, value=value)
+                                cells_written += 1
+                else:
+                    # Table-style sheet - match by column headers
+                    # For table sheets, row should be after header row
+                    if row_idx <= header_row:
+                        row_idx = header_row + 1 + row_idx_in  # Auto-increment if row is invalid
+                    
+                    for col_name, value in row_update.items():
+                        if col_name.startswith("_"):
+                            continue
 
-                        # Apply confidence-based coloring
-                        if cell_confidence == "low":
-                            cell.fill = FILL_LOW_CONFIDENCE
-                        elif cell_confidence == "medium":
-                            cell.fill = FILL_MEDIUM_CONFIDENCE
-                        # High confidence = no fill (keep default)
+                        # Handle value with embedded confidence
+                        cell_value = value
+                        raw_confidence = confidence_map.get(col_name, "high")
+                        cell_confidence = normalize_confidence(raw_confidence)
+
+                        if isinstance(value, dict):
+                            cell_value = value.get("value", value.get("v"))
+                            raw_conf = value.get("confidence", value.get("c", raw_confidence))
+                            cell_confidence = normalize_confidence(raw_conf)
+
+                        # Skip if no value or empty string
+                        if cell_value is None or cell_value == "":
+                            continue
+
+                        # Find the column index for this header - try multiple matching strategies
+                        col_idx = None
+                        
+                        # Strategy 1: Exact match
+                        col_idx = header_map.get(col_name)
+                        
+                        # Strategy 2: Case-insensitive match
+                        if col_idx is None:
+                            col_idx = header_map.get(col_name.lower().strip())
+                        
+                        # Strategy 3: Partial match (for long header names)
+                        if col_idx is None:
+                            col_name_clean = col_name.lower().strip()
+                            for header_key, idx in header_map.items():
+                                if isinstance(header_key, str):
+                                    header_clean = header_key.lower().strip()
+                                    # Check if col_name is contained in header or vice versa
+                                    if col_name_clean in header_clean or header_clean in col_name_clean:
+                                        col_idx = idx
+                                        print(f"      Fuzzy match: '{col_name}' -> '{header_key}' (col {idx})")
+                                        break
+                        
+                        # Strategy 4: Match by key words
+                        if col_idx is None:
+                            col_words = set(col_name.lower().split())
+                            best_match_score = 0
+                            for header_key, idx in header_map.items():
+                                if isinstance(header_key, str):
+                                    header_words = set(header_key.lower().split())
+                                    common = col_words & header_words
+                                    if len(common) > best_match_score and len(common) >= 2:
+                                        best_match_score = len(common)
+                                        col_idx = idx
+
+                        if col_idx:
+                            cell = ws.cell(row=row_idx, column=col_idx, value=cell_value)
+                            cells_written += 1
+
+                            # Apply confidence-based coloring
+                            if cell_confidence == "low":
+                                cell.fill = FILL_LOW_CONFIDENCE
+                            elif cell_confidence == "medium":
+                                cell.fill = FILL_MEDIUM_CONFIDENCE
+                        else:
+                            print(f"      Could not find column for '{col_name}' (value: {str(cell_value)[:50]}...)")
                 
                 if cells_written > 0:
                     print(f"    Row {row_idx}: Wrote {cells_written} cells")
+                else:
+                    print(f"    Row {row_idx}: No cells written! Data: {list(row_update.keys())}")
 
                 # Apply row-level confidence coloring for empty/missing cells
                 if row_confidence == "low":
-                    for col_idx in range(1, len(template.headers.get(actual_sheet_name, [])) + 1):
+                    for col_idx in range(1, len(template.headers.get(lookup_sheet_name, [])) + 1):
                         cell = ws.cell(row=row_idx, column=col_idx)
                         if cell.value is None:
                             cell.fill = FILL_LOW_CONFIDENCE
@@ -531,77 +654,100 @@ class SOC1Agent:
         template: ExcelTemplate,
     ) -> str:
         """Create a prompt for the AI to extract and map data."""
-        # Prepare template structure description
-        template_desc = []
-        for sheet_name, headers in template.headers.items():
-            template_desc.append(f"\nSheet: {sheet_name}")
-            template_desc.append(f"Columns: {', '.join(headers)}")
-
-            # Show sample of existing data
-            if template.structure.get(sheet_name):
-                sample_rows = template.structure[sheet_name][:3]
-                template_desc.append("Sample existing rows:")
-                for row in sample_rows:
-                    row_vals = {
-                        k: v.get("value") if isinstance(v, dict) else v
-                        for k, v in row.items()
-                        if not k.startswith("_")
-                    }
-                    template_desc.append(f"  {row_vals}")
-
-        template_info = "\n".join(template_desc)
-
-        # Prepare tables info if any
-        tables_info = ""
-        if pdf_content.tables:
-            tables_info = "\n\nExtracted Tables from PDF:\n"
-            for i, table in enumerate(pdf_content.tables[:10], 1):  # Limit to 10 tables
-                tables_info += f"\nTable {i}:\n"
-                for row in table[:20]:  # Limit rows per table
-                    tables_info += f"  {row}\n"
-
+        
         # Find sheets that match management review and CUEC patterns
         management_sheet = None
         cuec_sheet = None
+        deviations_sheet = None
+        
         for sheet_name in template.sheet_names:
             sheet_lower = sheet_name.lower()
-            if "management review" in sheet_lower:
+            if "management review" in sheet_lower and "1.0" in sheet_name:
                 management_sheet = sheet_name
             if "user entity" in sheet_lower or "cuec" in sheet_lower or "comp user" in sheet_lower:
                 cuec_sheet = sheet_name
+            if "deviation" in sheet_lower:
+                deviations_sheet = sheet_name
 
-        # Get column names for the key sheets
-        mgmt_cols = template.headers.get(management_sheet, [])[:10] if management_sheet else []
-        cuec_cols = template.headers.get(cuec_sheet, [])[:7] if cuec_sheet else []
-
-        return f"""Extract SOC1 data to fill Excel template. Be CONCISE.
-
-SHEETS TO FILL:
-1. "{management_sheet}" - columns: {', '.join(mgmt_cols[:8])}...
-2. "{cuec_sheet}" - columns: {', '.join(cuec_cols)}
-
-PDF CONTENT:
-{pdf_content.full_text[:60000]}
-
-Return ONLY valid JSON. No markdown, no commentary.
-{{
-  "{management_sheet}": [
-    {{"_row": 2, "_c": {{"col1": "h"}}, "col1": "value", "col2": "value"}},
-    {{"_row": 3, "_c": {{"col1": "m"}}, "col1": "value"}}
-  ],
-  "{cuec_sheet}": [
-    {{"_row": 2, "col1": "CUEC description"}}
-  ]
-}}
-
-CONFIDENCE in "_c" field: "h"=high (found), "m"=medium (inferred), "l"=low (not found)
-
-RULES:
-- Use EXACT column names from template
-- Keep values SHORT (max 100 chars)
-- One row per control/CUEC
-- Skip columns with no data
-- For CUECs: find "Complementary User Entity Controls" section"""
+        prompt_parts = []
+        prompt_parts.append("You are extracting data from a SOC1 Type II audit report to fill an Excel management review template.")
+        prompt_parts.append("\n\n## PDF REPORT CONTENT:\n")
+        prompt_parts.append(pdf_content.full_text[:80000])  # Increased limit to capture more content
+        
+        # Add extracted tables specifically
+        if pdf_content.tables:
+            prompt_parts.append("\n\n## EXTRACTED TABLES FROM PDF:\n")
+            for i, table in enumerate(pdf_content.tables[:15], 1):
+                prompt_parts.append(f"\nTable {i}:")
+                for row in table[:10]:
+                    prompt_parts.append(f"  {row}")
+        
+        prompt_parts.append("\n\n## EXCEL SHEETS TO FILL:\n")
+        
+        # Handle Management Review sheet (form-style)
+        if management_sheet and template.sheet_type.get(management_sheet) == "form":
+            form_fields = template.form_fields.get(management_sheet, [])
+            prompt_parts.append(f"\n### Sheet: {management_sheet} (FORM-STYLE)")
+            prompt_parts.append("This is a questionnaire. For each question, provide the answer from the PDF.")
+            prompt_parts.append("Fields to fill:")
+            for field in form_fields[:30]:  # Show up to 30 fields
+                label = field['label'][:80]
+                prompt_parts.append(f"  - Row {field['row']}: \"{label}\"")
+        
+        # Handle CUEC sheet (table-style)
+        if cuec_sheet and template.sheet_type.get(cuec_sheet) == "table":
+            cuec_headers = template.headers.get(cuec_sheet, [])
+            prompt_parts.append(f"\n### Sheet: {cuec_sheet} (TABLE)")
+            prompt_parts.append(f"Header row: {template.header_row.get(cuec_sheet)}")
+            prompt_parts.append("Column headers (USE THESE EXACT NAMES):")
+            for i, h in enumerate(cuec_headers[:10], 1):
+                prompt_parts.append(f"  {i}. \"{h}\"")
+            prompt_parts.append("\nLook for 'Complementary User Entity Controls' section in the PDF.")
+            prompt_parts.append("Extract each CUEC with its control objective.")
+        
+        # Handle Deviations sheet
+        if deviations_sheet and template.sheet_type.get(deviations_sheet) == "table":
+            dev_headers = template.headers.get(deviations_sheet, [])
+            prompt_parts.append(f"\n### Sheet: {deviations_sheet} (TABLE)")
+            prompt_parts.append(f"Header row: {template.header_row.get(deviations_sheet)}")
+            prompt_parts.append("Column headers:")
+            for i, h in enumerate(dev_headers[:10], 1):
+                prompt_parts.append(f"  {i}. \"{h}\"")
+        
+        # JSON format instructions
+        prompt_parts.append("\n\n## RETURN FORMAT:")
+        prompt_parts.append("Return ONLY valid JSON. No markdown code blocks, no commentary.")
+        prompt_parts.append("{")
+        
+        if management_sheet:
+            prompt_parts.append(f'  "{management_sheet}": [')
+            prompt_parts.append('    {"_row": 4, "Answer": "Okta, Inc."},  // Row 4 answer')
+            prompt_parts.append('    {"_row": 5, "Answer": "SOC1 Type II Report"},')
+            prompt_parts.append("    ...")
+            prompt_parts.append("  ],")
+        
+        if cuec_sheet:
+            cuec_h = template.headers.get(cuec_sheet, ["No.", "Description"])
+            h1 = cuec_h[0] if len(cuec_h) > 0 else "No."
+            h2 = cuec_h[2] if len(cuec_h) > 2 else "Description"
+            h3 = cuec_h[3] if len(cuec_h) > 3 else "Control Objective"
+            start_row = template.header_row.get(cuec_sheet, 1) + 1
+            prompt_parts.append(f'  "{cuec_sheet}": [')
+            prompt_parts.append(f'    {{"_row": {start_row}, "{h1}": "1", "{h2}": "User entities are responsible for...", "{h3}": "CO 2 - Logical access"}},')
+            prompt_parts.append(f'    {{"_row": {start_row + 1}, "{h1}": "2", "{h2}": "Another CUEC...", "{h3}": "CO 2 - Logical access"}}')
+            prompt_parts.append("  ]")
+        
+        prompt_parts.append("}")
+        
+        prompt_parts.append("\n\n## IMPORTANT RULES:")
+        prompt_parts.append("1. Use EXACT column names from the headers listed above")
+        prompt_parts.append("2. For table sheets, _row is the row number (starts after header row)")
+        prompt_parts.append("3. For form sheets, _row matches the row of the question label")
+        prompt_parts.append("4. Extract ALL CUECs from the 'Complementary User Entity Controls' section")
+        prompt_parts.append("5. Keep values concise but complete")
+        prompt_parts.append("6. Return valid JSON only - no markdown, no extra text")
+        
+        return "\n".join(prompt_parts)
 
     def extract_and_map(
         self,
@@ -620,11 +766,32 @@ RULES:
         """
         try:
             prompt = self._create_extraction_prompt(pdf_content, template)
+            print(f"\n{'='*60}")
+            print("AI EXTRACTION")
+            print(f"{'='*60}")
+            print(f"Prompt length: {len(prompt)} chars")
+            print(f"Template sheets: {template.sheet_names}")
+            print(f"Sheet types: {template.sheet_type}")
+            
             # Use larger token limit to avoid truncation
             response_text = self._generate(prompt, max_tokens=65536, expect_json=True)
-            return self._parse_json_response(response_text)
+            
+            print(f"\nAI Response length: {len(response_text)} chars")
+            print(f"Response preview: {response_text[:500]}...")
+            
+            result = self._parse_json_response(response_text)
+            
+            print(f"\nParsed result keys: {list(result.keys())}")
+            for sheet, rows in result.items():
+                print(f"  {sheet}: {len(rows)} rows")
+                if rows:
+                    print(f"    First row keys: {list(rows[0].keys())}")
+            
+            return result
         except Exception as e:
-            print(f"Main extraction failed: {e}")
+            print(f"\nMain extraction failed: {e}")
+            import traceback
+            traceback.print_exc()
             print("Trying simplified extraction...")
             return self._extract_simplified(pdf_content, template)
 
@@ -644,41 +811,89 @@ RULES:
                 continue
             
             headers = template.headers.get(sheet_name, [])
-            if not headers:
-                continue
+            header_row = template.header_row.get(sheet_name, 1)
+            sheet_type = template.sheet_type.get(sheet_name, "table")
             
-            prompt = f"""Extract data from this SOC1 report to fill the Excel sheet "{sheet_name}".
+            print(f"\n--- Simplified extraction for '{sheet_name}' ---")
+            print(f"  Sheet type: {sheet_type}, Headers: {headers[:5]}")
+            
+            if "user entity" in sheet_lower or "cuec" in sheet_lower or "comp user" in sheet_lower:
+                # Special handling for CUEC sheet - look specifically for the CUEC section
+                prompt = f"""Extract Complementary User Entity Controls (CUECs) from this SOC1 Type II report.
 
-Sheet columns: {', '.join(headers[:15])}  
+Look for the section titled "Complementary User Entity Controls" or "CUECs".
 
-PDF Content (excerpt):
-{pdf_content.full_text[:40000]}
+PDF Content:
+{pdf_content.full_text}
 
-Return a JSON array of rows. Each row has "_row" (starting at 2) and column values.
-Keep values SHORT and concise. Example:
+Excel columns to fill (USE THESE EXACT NAMES):
+{chr(10).join(f'  - "{h}"' for h in headers[:7])}
+
+The header row is {header_row}, so data starts at row {header_row + 1}.
+
+Return JSON array with one object per CUEC found:
 [
-  {{"_row": 2, "{headers[0] if headers else 'Col1'}": "value1", "{headers[1] if len(headers) > 1 else 'Col2'}": "value2"}},
-  {{"_row": 3, "{headers[0] if headers else 'Col1'}": "value3"}}
+  {{"_row": {header_row + 1}, "No.": "1", "{headers[2] if len(headers) > 2 else 'Description'}": "User entities are responsible for...", "{headers[3] if len(headers) > 3 else 'Control Objective'}": "CO 2 - Logical access"}},
+  {{"_row": {header_row + 2}, "No.": "2", "{headers[2] if len(headers) > 2 else 'Description'}": "Another control...", "{headers[3] if len(headers) > 3 else 'Control Objective'}": "CO 2 - Logical access"}}
 ]
 
-Return ONLY the JSON array."""
+Return ONLY valid JSON array. No markdown, no commentary."""
+
+            elif "management review" in sheet_lower:
+                # Management review form
+                form_fields = template.form_fields.get(sheet_name, [])
+                fields_text = "\n".join(f"  Row {f['row']}: {f['label'][:60]}" for f in form_fields[:25])
+                
+                prompt = f"""Extract answers for this SOC1 Management Review questionnaire.
+
+PDF Content:
+{pdf_content.full_text[:50000]}
+
+Questions to answer (row number: question):
+{fields_text}
+
+Return JSON array with answers:
+[
+  {{"_row": 4, "Answer": "Okta, Inc."}},
+  {{"_row": 5, "Answer": "SOC1 Type II Report"}},
+  ...
+]
+
+Return ONLY valid JSON array. No markdown."""
+            else:
+                # Generic extraction
+                prompt = f"""Extract data from this SOC1 report for sheet "{sheet_name}".
+
+Columns: {', '.join(headers[:10])}
+
+PDF Content:
+{pdf_content.full_text[:40000]}
+
+Return JSON array:
+[{{"_row": {header_row + 1}, "{headers[0]}": "value"}}]
+
+Return ONLY JSON."""
 
             try:
-                response = self._generate(prompt, max_tokens=16384, expect_json=True)
+                response = self._generate(prompt, max_tokens=32768, expect_json=True)
+                print(f"  Response length: {len(response)} chars")
+                print(f"  Response preview: {response[:300]}...")
+                
                 rows = self._parse_json_response(response)
                 
                 # Handle both array and object responses
                 if isinstance(rows, list):
                     result[sheet_name] = rows
+                    print(f"  Extracted {len(rows)} rows")
                 elif isinstance(rows, dict):
-                    # If it returned an object with the sheet name as key
                     if sheet_name in rows:
                         result[sheet_name] = rows[sheet_name]
                     else:
-                        # Wrap single row in array
                         result[sheet_name] = [rows] if "_row" in rows else []
             except Exception as e:
-                print(f"Failed to extract sheet {sheet_name}: {e}")
+                print(f"  Failed: {e}")
+                import traceback
+                traceback.print_exc()
                 result[sheet_name] = []
         
         return result
