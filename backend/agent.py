@@ -10,6 +10,7 @@ This module provides functionality to:
 
 from __future__ import annotations
 
+import gc
 import json
 import os
 import re
@@ -80,7 +81,8 @@ class PDFExtractor:
         Returns:
             ExtractedPDFContent with full text, per-page text, tables, and metadata
         """
-        pages: list[str] = []
+        # MEMORY FIX: Build full_text directly instead of storing all pages
+        text_parts: list[str] = []
         tables: list[list[list[str]]] = []
         metadata: dict[str, Any] = {}
 
@@ -90,26 +92,34 @@ class PDFExtractor:
                 "metadata": pdf.metadata or {},
             }
 
-            for page in pdf.pages:
+            # MEMORY FIX: Limit to first 50 pages to prevent memory issues
+            max_pages = min(50, len(pdf.pages))
+            
+            for i, page in enumerate(pdf.pages[:max_pages]):
                 # Extract text from page
                 page_text = page.extract_text() or ""
-                pages.append(page_text)
+                text_parts.append(page_text)
 
-                # Extract tables from page
-                page_tables = page.extract_tables() or []
-                for table in page_tables:
-                    # Clean up table data
-                    cleaned_table = [
-                        [str(cell) if cell is not None else "" for cell in row]
-                        for row in table
-                    ]
-                    tables.append(cleaned_table)
+                # Extract tables from page (MEMORY FIX: limit to 20 tables total)
+                if len(tables) < 20:
+                    page_tables = page.extract_tables() or []
+                    for table in page_tables:
+                        if len(tables) >= 20:
+                            break
+                        # Clean up table data
+                        cleaned_table = [
+                            [str(cell) if cell is not None else "" for cell in row]
+                            for row in table
+                        ]
+                        tables.append(cleaned_table)
 
-        full_text = "\n\n--- Page Break ---\n\n".join(pages)
-
+        full_text = "\n\n--- Page Break ---\n\n".join(text_parts)
+        
+        # MEMORY FIX: Don't store individual pages, just return empty list
+        # This saves significant memory for large PDFs
         return ExtractedPDFContent(
             full_text=full_text,
-            pages=pages,
+            pages=[],  # Empty to save memory
             tables=tables,
             metadata=metadata,
         )
@@ -672,14 +682,16 @@ class SOC1Agent:
         prompt_parts = []
         prompt_parts.append("You are extracting data from a SOC1 Type II audit report to fill an Excel management review template.")
         prompt_parts.append("\n\n## PDF REPORT CONTENT:\n")
-        prompt_parts.append(pdf_content.full_text[:80000])  # Increased limit to capture more content
+        # MEMORY FIX: Reduced from 80000 to 40000 chars to save memory
+        prompt_parts.append(pdf_content.full_text[:40000])
         
-        # Add extracted tables specifically
+        # Add extracted tables specifically (MEMORY FIX: reduced from 15 to 10 tables)
         if pdf_content.tables:
             prompt_parts.append("\n\n## EXTRACTED TABLES FROM PDF:\n")
-            for i, table in enumerate(pdf_content.tables[:15], 1):
+            for i, table in enumerate(pdf_content.tables[:10], 1):
                 prompt_parts.append(f"\nTable {i}:")
-                for row in table[:10]:
+                # MEMORY FIX: Only show first 5 rows instead of 10
+                for row in table[:5]:
                     prompt_parts.append(f"  {row}")
         
         prompt_parts.append("\n\n## EXCEL SHEETS TO FILL:\n")
@@ -773,8 +785,8 @@ class SOC1Agent:
             print(f"Template sheets: {template.sheet_names}")
             print(f"Sheet types: {template.sheet_type}")
             
-            # Use larger token limit to avoid truncation
-            response_text = self._generate(prompt, max_tokens=65536, expect_json=True)
+            # MEMORY FIX: Reduced from 65536 to 32768 tokens to save memory
+            response_text = self._generate(prompt, max_tokens=32768, expect_json=True)
             
             print(f"\nAI Response length: {len(response_text)} chars")
             print(f"Response preview: {response_text[:500]}...")
@@ -819,12 +831,29 @@ class SOC1Agent:
             
             if "user entity" in sheet_lower or "cuec" in sheet_lower or "comp user" in sheet_lower:
                 # Special handling for CUEC sheet - look specifically for the CUEC section
+                # MEMORY FIX: Only send relevant portion of PDF for CUECs
+                # Look for CUEC section in the text
+                cuec_section = ""
+                full_text_lower = pdf_content.full_text.lower()
+                cuec_start = full_text_lower.find("complementary user entity control")
+                if cuec_start == -1:
+                    cuec_start = full_text_lower.find("cuec")
+                
+                if cuec_start != -1:
+                    # Extract 20000 chars around the CUEC section
+                    start = max(0, cuec_start - 5000)
+                    end = min(len(pdf_content.full_text), cuec_start + 15000)
+                    cuec_section = pdf_content.full_text[start:end]
+                else:
+                    # Fallback: use last 20000 chars (CUECs often at end)
+                    cuec_section = pdf_content.full_text[-20000:]
+                
                 prompt = f"""Extract Complementary User Entity Controls (CUECs) from this SOC1 Type II report.
 
 Look for the section titled "Complementary User Entity Controls" or "CUECs".
 
-PDF Content:
-{pdf_content.full_text}
+PDF Content (relevant section):
+{cuec_section}
 
 Excel columns to fill (USE THESE EXACT NAMES):
 {chr(10).join(f'  - "{h}"' for h in headers[:7])}
@@ -844,10 +873,11 @@ Return ONLY valid JSON array. No markdown, no commentary."""
                 form_fields = template.form_fields.get(sheet_name, [])
                 fields_text = "\n".join(f"  Row {f['row']}: {f['label'][:60]}" for f in form_fields[:25])
                 
+                # MEMORY FIX: Reduced from 50000 to 30000 chars
                 prompt = f"""Extract answers for this SOC1 Management Review questionnaire.
 
 PDF Content:
-{pdf_content.full_text[:50000]}
+{pdf_content.full_text[:30000]}
 
 Questions to answer (row number: question):
 {fields_text}
@@ -986,6 +1016,9 @@ async def process_soc1_documents(
     pdf_content = PDFExtractor.extract(type_ii_path)
     print(f"  - Extracted {len(pdf_content.pages)} pages")
     print(f"  - Found {len(pdf_content.tables)} tables")
+    
+    # MEMORY FIX: Force garbage collection after PDF extraction
+    gc.collect()
 
     # Step 2: Read Excel template
     print(f"Reading Excel template: {management_review_path}")
@@ -1000,6 +1033,10 @@ async def process_soc1_documents(
 
     print("Extracting and mapping content using AI...")
     mappings = agent.extract_and_map(pdf_content, template)
+    
+    # MEMORY FIX: Clear PDF content from memory after extraction
+    del pdf_content
+    gc.collect()
 
     # Step 4: Fill the template
     output_filename = f"filled_{management_review_path.name}"
