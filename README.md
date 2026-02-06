@@ -69,6 +69,7 @@ Open `http://localhost:5173` to use the UI.
 - `POST /api/feedback/{job_id}` - Submit user feedback on extraction quality
 - `GET /api/feedback/stats` - Get aggregated feedback statistics (admin)
 - `POST /api/cleanup-uploads` - Clear temporary upload files (maintenance)
+- `POST /api/cleanup-old-files` - Remove output files older than 24 hours (maintenance)
 
 ## Architecture
 

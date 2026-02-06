@@ -24,9 +24,34 @@ app.add_middleware(
 )
 
 # In-memory job status storage (use Redis/DB in production)
-# Store both metadata and the generated Excel file bytes in memory
 job_status: dict[str, dict[str, Any]] = {}
-job_files: dict[str, bytes] = {}  # Store generated Excel files in memory
+
+# MEMORY FIX: Store file paths instead of file bytes in memory
+# This prevents memory accumulation from multiple jobs
+output_dir = Path("output_files")
+output_dir.mkdir(exist_ok=True)
+
+
+@app.on_event("startup")
+async def startup_event():
+    """Clean up old files on startup to prevent disk space issues."""
+    import time
+    from datetime import timedelta
+    
+    # Clean files older than 24 hours on startup
+    cutoff_time = time.time() - (24 * 3600)
+    cleaned = 0
+    
+    if output_dir.exists():
+        for file_path in output_dir.iterdir():
+            if file_path.is_file() and file_path.stat().st_mtime < cutoff_time:
+                try:
+                    file_path.unlink()
+                    cleaned += 1
+                except Exception:
+                    pass
+    
+    print(f"Startup: Cleaned {cleaned} old output file(s)")
 
 
 @app.get("/api/health")
@@ -40,24 +65,19 @@ async def process_job(job_id: str, type_ii_path: Path, management_path: Path):
         job_status[job_id]["status"] = "processing"
         job_status[job_id]["message"] = "Extracting PDF content and mapping to Excel template..."
 
-        # Use a temporary directory for the processing pipeline
-        import tempfile
-        import shutil
-        
-        temp_dir = tempfile.mkdtemp()
-
         result = await process_soc1_documents(
             type_ii_path=type_ii_path,
             management_review_path=management_path,
-            output_dir=Path(temp_dir),
+            output_dir=output_dir,  # Use persistent output directory
         )
 
-        # Read the generated Excel file into memory
+        # MEMORY FIX: Store file path instead of reading into memory
         output_path = Path(result["output_path"])
         if output_path.exists():
-            file_bytes = output_path.read_bytes()
-            job_files[job_id] = file_bytes
             output_filename = output_path.name
+            # Rename to include job_id for easy lookup
+            final_path = output_dir / f"{job_id}_{output_filename}"
+            output_path.rename(final_path)
         else:
             raise FileNotFoundError(f"Generated file not found: {output_path}")
 
@@ -66,10 +86,8 @@ async def process_job(job_id: str, type_ii_path: Path, management_path: Path):
             "message": "SOC 1 management review generated successfully.",
             "result": result,
             "output_filename": output_filename,
+            "output_path": str(final_path),  # Store path, not bytes
         })
-
-        # Clean up temporary files after reading
-        shutil.rmtree(temp_dir, ignore_errors=True)
         
         # Clean up uploaded files
         type_ii_path.unlink(missing_ok=True)
@@ -195,7 +213,7 @@ def get_status(job_id: str) -> dict[str, Any]:
 
 @app.get("/api/download/{job_id}")
 def download_result(job_id: str):
-    """Download the generated Excel file from memory."""
+    """Download the generated Excel file from disk."""
     if job_id not in job_status:
         return {"error": "Job not found"}
 
@@ -203,15 +221,16 @@ def download_result(job_id: str):
     if status.get("status") != "completed":
         return {"error": "Job not completed yet", "status": status.get("status")}
 
-    if job_id not in job_files:
-        return {"error": "Generated file not found in memory"}
+    # MEMORY FIX: Read from disk instead of memory
+    file_path = status.get("output_path")
+    if not file_path or not Path(file_path).exists():
+        return {"error": "Generated file not found on disk"}
 
-    file_bytes = job_files[job_id]
     filename = status.get("output_filename", "soc1_management_review.xlsx")
 
-    # Return the file as a streaming response
+    # Return the file as a streaming response (reads from disk, not memory)
     return StreamingResponse(
-        io.BytesIO(file_bytes),
+        open(file_path, "rb"),
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         headers={"Content-Disposition": f"attachment; filename={filename}"},
     )
@@ -363,5 +382,54 @@ def cleanup_uploads() -> dict[str, Any]:
             "status": "failed",
             "message": f"Cleanup failed: {str(e)}",
             "files_deleted": 0,
+            "error": str(e),
+        }
+
+
+@app.post("/api/cleanup-old-files")
+def cleanup_old_files(max_age_hours: int = 24) -> dict[str, Any]:
+    """
+    Clean up old output files to prevent disk space issues.
+    MEMORY FIX: This prevents accumulation of generated files.
+    """
+    from datetime import datetime, timedelta, timezone
+    import time
+    
+    cutoff_time = time.time() - (max_age_hours * 3600)
+    files_deleted = 0
+    errors = []
+    
+    try:
+        # Clean old output files
+        if output_dir.exists():
+            for file_path in output_dir.iterdir():
+                if file_path.is_file():
+                    try:
+                        if file_path.stat().st_mtime < cutoff_time:
+                            file_path.unlink()
+                            files_deleted += 1
+                    except Exception as e:
+                        errors.append(f"Failed to delete {file_path.name}: {str(e)}")
+        
+        # Clean old job status entries
+        old_jobs = [
+            job_id for job_id, status in job_status.items()
+            if status.get("created_at") and 
+            datetime.fromisoformat(status["created_at"]).timestamp() < cutoff_time
+        ]
+        for job_id in old_jobs:
+            del job_status[job_id]
+        
+        return {
+            "status": "success",
+            "message": f"Cleaned up {files_deleted} old file(s) and {len(old_jobs)} job entries",
+            "files_deleted": files_deleted,
+            "jobs_cleaned": len(old_jobs),
+            "errors": errors if errors else None,
+        }
+    except Exception as e:
+        return {
+            "status": "failed",
+            "message": f"Cleanup failed: {str(e)}",
             "error": str(e),
         }
