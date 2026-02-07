@@ -297,14 +297,18 @@ ${summary?.cuec_findings && summary.cuec_findings.length > 0 ? `
     }
 
     try {
-      const formData = new FormData();
-      formData.append("rating", feedbackRating.toString());
-      formData.append("feedback_text", feedbackText);
-      feedbackIssues.forEach((issue) => formData.append("issues", issue));
+      const payload = {
+        rating: feedbackRating,
+        feedback_text: feedbackText,
+        issues: feedbackIssues,
+      };
 
       const response = await fetch(`${API_BASE}/feedback/${jobId}`, {
         method: "POST",
-        body: formData,
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify(payload),
       });
 
       if (response.ok) {
@@ -313,6 +317,11 @@ ${summary?.cuec_findings && summary.cuec_findings.length > 0 ? `
           setShowFeedback(false);
           setFeedbackSubmitted(false);
         }, 2000);
+      } else {
+        console.error("Response status:", response.status);
+        const errorData = await response.json();
+        console.error("Error details:", errorData);
+        alert("Failed to submit feedback. Please try again.");
       }
     } catch (err) {
       console.error("Failed to submit feedback:", err);
