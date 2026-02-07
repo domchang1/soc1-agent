@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import io
 import os
+import json
 import traceback
 from datetime import datetime, timezone
 from pathlib import Path
@@ -10,6 +11,7 @@ from typing import Any
 from fastapi import FastAPI, File, UploadFile, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
+from pydantic import BaseModel
 
 from agent import process_soc1_documents
 
@@ -52,6 +54,13 @@ async def startup_event():
                     pass
     
     print(f"Startup: Cleaned {cleaned} old output file(s)")
+
+
+class FeedbackRequest(BaseModel):
+    """Request model for feedback submission."""
+    rating: int
+    feedback_text: str = ""
+    issues: list[str] = []
 
 
 @app.get("/api/health")
@@ -239,20 +248,14 @@ def download_result(job_id: str):
 @app.post("/api/feedback/{job_id}")
 async def submit_feedback(
     job_id: str,
-    rating: int,
-    feedback_text: str = "",
-    issues: list[str] = [],
-    corrected_file: UploadFile = File(None),
+    feedback: FeedbackRequest,
 ) -> dict[str, Any]:
     """
     Submit feedback for a completed job.
     
     Args:
         job_id: The job ID to provide feedback for
-        rating: 1-5 star rating
-        feedback_text: Optional detailed feedback text
-        issues: List of issue categories (e.g., "missing_controls", "incorrect_mapping")
-        corrected_file: Optional corrected Excel file for training data
+        feedback: Feedback data including rating, text, and issues
     """
     if job_id not in job_status:
         return {"error": "Job not found"}
@@ -264,9 +267,9 @@ async def submit_feedback(
     feedback_data = {
         "job_id": job_id,
         "timestamp": datetime.now(timezone.utc).isoformat(),
-        "rating": rating,
-        "feedback_text": feedback_text,
-        "issues": issues,
+        "rating": feedback.rating,
+        "feedback_text": feedback.feedback_text,
+        "issues": feedback.issues,
         "job_metadata": {
             "type_ii_report": job_status[job_id].get("type_ii_report"),
             "management_review": job_status[job_id].get("management_review"),
@@ -274,16 +277,8 @@ async def submit_feedback(
         },
     }
     
-    # Save corrected file if provided
-    if corrected_file:
-        corrected_path = feedback_dir / f"{job_id}_corrected.xlsx"
-        corrected_bytes = await corrected_file.read()
-        corrected_path.write_bytes(corrected_bytes)
-        feedback_data["corrected_file"] = str(corrected_path)
-    
     # Append feedback to JSON log
     feedback_log = feedback_dir / "feedback_log.json"
-    import json
     
     if feedback_log.exists():
         with open(feedback_log, "r") as f:
@@ -316,7 +311,6 @@ def get_feedback_stats() -> dict[str, Any]:
             "common_issues": {},
         }
     
-    import json
     with open(feedback_log, "r") as f:
         all_feedback = json.load(f)
     
