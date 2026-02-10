@@ -18,12 +18,21 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+import psutil
 from google import genai
 from google.genai import types
 import openpyxl
 import pdfplumber
 from dotenv import load_dotenv
 from openpyxl.styles import PatternFill
+
+
+def log_memory(label: str) -> float:
+    """Log current process RSS memory usage. Returns RSS in MB."""
+    process = psutil.Process(os.getpid())
+    rss_mb = process.memory_info().rss / (1024 * 1024)
+    print(f"[MEMORY] {label}: {rss_mb:.1f} MB RSS")
+    return rss_mb
 
 # Confidence level color fills
 FILL_HIGH_CONFIDENCE = None  # No fill - confident
@@ -140,7 +149,7 @@ class ExcelHandler:
         Returns:
             Tuple of (workbook, ExcelTemplate)
         """
-        wb = openpyxl.load_workbook(excel_path)
+        wb = openpyxl.load_workbook(excel_path, data_only=True)
         sheet_names = wb.sheetnames
         headers: dict[str, list[str]] = {}
         header_to_col: dict[str, dict[str, int]] = {}
@@ -1011,14 +1020,14 @@ async def process_soc1_documents(
 
     output_dir.mkdir(parents=True, exist_ok=True)
 
+    log_memory("start of process_soc1_documents")
+
     # Step 1: Extract PDF content
     print(f"Extracting content from PDF: {type_ii_path}")
     pdf_content = PDFExtractor.extract(type_ii_path)
     print(f"  - Extracted {len(pdf_content.pages)} pages")
     print(f"  - Found {len(pdf_content.tables)} tables")
-    
-    # MEMORY FIX: Force garbage collection after PDF extraction
-    gc.collect()
+    log_memory("after PDF extraction")
 
     # Step 2: Read Excel template
     print(f"Reading Excel template: {management_review_path}")
@@ -1026,6 +1035,7 @@ async def process_soc1_documents(
     print(f"  - Found sheets: {template.sheet_names}")
     for sheet, headers in template.headers.items():
         print(f"  - {sheet}: {len(headers)} columns")
+    log_memory("after Excel template load")
 
     # Step 3: Initialize AI agent and process
     print("Initializing Google Gemini AI agent...")
@@ -1033,10 +1043,7 @@ async def process_soc1_documents(
 
     print("Extracting and mapping content using AI...")
     mappings = agent.extract_and_map(pdf_content, template)
-    
-    # MEMORY FIX: Clear PDF content from memory after extraction
-    del pdf_content
-    gc.collect()
+    log_memory("after AI extraction")
 
     # Step 4: Fill the template
     output_filename = f"filled_{management_review_path.name}"
@@ -1045,17 +1052,47 @@ async def process_soc1_documents(
     print("Filling Excel template...")
     ExcelHandler.fill_template(workbook, template, mappings, output_path)
     print(f"  - Saved to: {output_path}")
+    log_memory("after workbook save")
 
-    # Step 5: Analyze for gaps
+    # Free the workbook now that it's saved to disk
+    workbook.close()
+    del workbook
+    gc.collect()
+    log_memory("after workbook freed")
+
+    # Step 5: Analyze for gaps (only needs a subset of PDF text)
+    # Trim pdf_content to reduce memory before gap analysis
+    pdf_metadata = pdf_content.metadata
+    template_sheets = template.sheet_names
+    pdf_text_for_analysis = pdf_content.full_text[:10000]
+
+    # Free the bulk of PDF content
+    pdf_content.full_text = ""
+    pdf_content.pages.clear()
+    pdf_content.tables.clear()
+    del template
+    gc.collect()
+    log_memory("after freeing PDF content and template")
+
     print("Analyzing extraction for completeness...")
-    analysis = agent.analyze_for_gaps(pdf_content, mappings)
+    # Build a lightweight PDF content object for analysis
+    analysis_pdf = ExtractedPDFContent(
+        full_text=pdf_text_for_analysis,
+        pages=[],
+        tables=[],
+        metadata=pdf_metadata,
+    )
+    analysis = agent.analyze_for_gaps(analysis_pdf, mappings)
+    del analysis_pdf, pdf_text_for_analysis
+    gc.collect()
+    log_memory("after gap analysis")
 
     return {
         "output_path": str(output_path),
         "analysis": analysis,
         "status": "completed",
-        "pdf_metadata": pdf_content.metadata,
-        "template_sheets": template.sheet_names,
+        "pdf_metadata": pdf_metadata,
+        "template_sheets": template_sheets,
     }
 
 

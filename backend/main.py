@@ -1,19 +1,19 @@
 from __future__ import annotations
 
-import io
 import os
 import json
 import traceback
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import Any
 
+import psutil
 from fastapi import FastAPI, File, UploadFile, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
+from fastapi.responses import FileResponse
 from pydantic import BaseModel
 
-from agent import process_soc1_documents
+from agent import process_soc1_documents, log_memory
 
 app = FastAPI(title="SOC 1 Generator API")
 
@@ -25,35 +25,20 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# ---------------------------------------------------------------------------
+# Storage
+# ---------------------------------------------------------------------------
 # In-memory job status storage (use Redis/DB in production)
 job_status: dict[str, dict[str, Any]] = {}
+# Map job_id -> Path on disk for the generated Excel file
+job_files: dict[str, Path] = {}
 
-# MEMORY FIX: Store file paths instead of file bytes in memory
-# This prevents memory accumulation from multiple jobs
-output_dir = Path("output_files")
-output_dir.mkdir(exist_ok=True)
+# Persistent directory for generated output files
+OUTPUT_DIR = Path("output_files")
+OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
-
-@app.on_event("startup")
-async def startup_event():
-    """Clean up old files on startup to prevent disk space issues."""
-    import time
-    from datetime import timedelta
-    
-    # Clean files older than 24 hours on startup
-    cutoff_time = time.time() - (24 * 3600)
-    cleaned = 0
-    
-    if output_dir.exists():
-        for file_path in output_dir.iterdir():
-            if file_path.is_file() and file_path.stat().st_mtime < cutoff_time:
-                try:
-                    file_path.unlink()
-                    cleaned += 1
-                except Exception:
-                    pass
-    
-    print(f"Startup: Cleaned {cleaned} old output file(s)")
+# How long to keep completed jobs before cleanup (1 hour)
+JOB_TTL = timedelta(hours=1)
 
 
 class FeedbackRequest(BaseModel):
@@ -63,9 +48,72 @@ class FeedbackRequest(BaseModel):
     issues: list[str] = []
 
 
+# ---------------------------------------------------------------------------
+# TTL cleanup
+# ---------------------------------------------------------------------------
+def cleanup_expired_jobs() -> int:
+    """Remove job_status, job_files, and output files older than JOB_TTL.
+
+    Returns the number of jobs cleaned up.
+    """
+    now = datetime.now(timezone.utc)
+    expired_ids: list[str] = []
+
+    for job_id, status in job_status.items():
+        created_str = status.get("created_at", "")
+        if not created_str:
+            continue
+        try:
+            created = datetime.strptime(created_str, "%Y%m%d%H%M%S").replace(
+                tzinfo=timezone.utc
+            )
+            if now - created > JOB_TTL:
+                expired_ids.append(job_id)
+        except ValueError:
+            continue
+
+    for job_id in expired_ids:
+        # Remove output file from disk
+        file_path = job_files.pop(job_id, None)
+        if file_path and file_path.exists():
+            file_path.unlink(missing_ok=True)
+        # Remove status metadata
+        job_status.pop(job_id, None)
+
+    if expired_ids:
+        print(f"[CLEANUP] Removed {len(expired_ids)} expired job(s): {expired_ids}")
+
+    return len(expired_ids)
+
+
+# ---------------------------------------------------------------------------
+# Endpoints
+# ---------------------------------------------------------------------------
 @app.get("/api/health")
 def health() -> dict[str, str]:
     return {"status": "ok"}
+
+
+@app.get("/api/debug/memory")
+def debug_memory() -> dict[str, Any]:
+    """Return current process memory usage for debugging."""
+    process = psutil.Process(os.getpid())
+    mem = process.memory_info()
+    return {
+        "rss_mb": round(mem.rss / (1024 * 1024), 1),
+        "vms_mb": round(mem.vms / (1024 * 1024), 1),
+        "active_jobs": sum(
+            1 for s in job_status.values() if s.get("status") == "processing"
+        ),
+        "stored_jobs": len(job_status),
+        "stored_files": len(job_files),
+        "stored_files_total_mb": round(
+            sum(
+                p.stat().st_size for p in job_files.values() if p.exists()
+            ) / (1024 * 1024),
+            1,
+        ),
+    }
 
 
 async def process_job(job_id: str, type_ii_path: Path, management_path: Path):
@@ -74,31 +122,51 @@ async def process_job(job_id: str, type_ii_path: Path, management_path: Path):
         job_status[job_id]["status"] = "processing"
         job_status[job_id]["message"] = "Extracting PDF content and mapping to Excel template..."
 
+        log_memory(f"process_job start ({job_id})")
+
         result = await process_soc1_documents(
             type_ii_path=type_ii_path,
             management_review_path=management_path,
-            output_dir=output_dir,  # Use persistent output directory
+            output_dir=OUTPUT_DIR,
         )
 
-        # MEMORY FIX: Store file path instead of reading into memory
+        # Move the generated file to the persistent output directory
+        # (process_soc1_documents already writes to OUTPUT_DIR)
         output_path = Path(result["output_path"])
-        if output_path.exists():
-            output_filename = output_path.name
-            # Rename to include job_id for easy lookup
-            final_path = output_dir / f"{job_id}_{output_filename}"
-            output_path.rename(final_path)
-        else:
+        if not output_path.exists():
             raise FileNotFoundError(f"Generated file not found: {output_path}")
+
+        # Store path reference (NOT the file bytes)
+        job_files[job_id] = output_path
+        output_filename = output_path.name
+
+        # Store only the lightweight analysis summary, not the full result dict
+        analysis = result.get("analysis", {})
+        analysis_summary = {
+            "total_controls": analysis.get("total_controls_identified", "N/A"),
+            "exceptions": analysis.get("controls_with_exceptions", "N/A"),
+            "total_cuecs": analysis.get("total_cuecs_identified", "N/A"),
+            "cells_needing_review": analysis.get("cells_needing_review", {
+                "low_confidence": 0,
+                "medium_confidence": 0,
+            }),
+            "summary": analysis.get("summary", ""),
+            "key_findings": analysis.get("key_findings", [])[:5],
+            "cuec_findings": analysis.get("cuec_findings", [])[:5],
+        }
 
         job_status[job_id].update({
             "status": "completed",
             "message": "SOC 1 management review generated successfully.",
-            "result": result,
             "output_filename": output_filename,
-            "output_path": str(final_path),  # Store path, not bytes
+            "analysis_summary": analysis_summary,
+            "pdf_metadata": result.get("pdf_metadata"),
+            "template_sheets": result.get("template_sheets"),
         })
-        
-        # Clean up uploaded files
+
+        log_memory(f"process_job completed ({job_id})")
+
+        # Clean up uploaded source files
         type_ii_path.unlink(missing_ok=True)
         management_path.unlink(missing_ok=True)
 
@@ -108,7 +176,7 @@ async def process_job(job_id: str, type_ii_path: Path, management_path: Path):
             "message": f"Processing failed: {str(e)}",
             "error": traceback.format_exc(),
         })
-        
+
         # Clean up uploaded files even on error
         type_ii_path.unlink(missing_ok=True)
         management_path.unlink(missing_ok=True)
@@ -120,6 +188,9 @@ async def upload(
     type_ii_report: UploadFile = File(...),
     management_review: UploadFile = File(...),
 ) -> dict[str, Any]:
+    # Run TTL cleanup on each new upload to keep memory bounded
+    cleanup_expired_jobs()
+
     upload_root = Path("uploads")
     upload_root.mkdir(parents=True, exist_ok=True)
 
@@ -129,11 +200,18 @@ async def upload(
     type_ii_path = upload_root / f"type-ii-{timestamp}-{type_ii_report.filename}"
     management_path = upload_root / f"management-review-{timestamp}-{management_review.filename}"
 
-    type_ii_bytes = await type_ii_report.read()
-    management_bytes = await management_review.read()
+    # Stream files to disk in chunks instead of reading entirely into memory
+    type_ii_size = 0
+    with open(type_ii_path, "wb") as f:
+        while chunk := await type_ii_report.read(1024 * 64):  # 64 KB chunks
+            f.write(chunk)
+            type_ii_size += len(chunk)
 
-    type_ii_path.write_bytes(type_ii_bytes)
-    management_path.write_bytes(management_bytes)
+    management_size = 0
+    with open(management_path, "wb") as f:
+        while chunk := await management_review.read(1024 * 64):  # 64 KB chunks
+            f.write(chunk)
+            management_size += len(chunk)
 
     # Initialize job status
     job_status[job_id] = {
@@ -155,11 +233,11 @@ async def upload(
             "message": "Upload complete but processing cannot start - GOOGLE_API_KEY not configured.",
             "type_ii_report": {
                 "filename": type_ii_report.filename,
-                "bytes": len(type_ii_bytes),
+                "bytes": type_ii_size,
             },
             "management_review": {
                 "filename": management_review.filename,
-                "bytes": len(management_bytes),
+                "bytes": management_size,
             },
             "soc1_output": {
                 "status": "failed",
@@ -180,11 +258,11 @@ async def upload(
         "message": "Upload complete. SOC 1 generation started.",
         "type_ii_report": {
             "filename": type_ii_report.filename,
-            "bytes": len(type_ii_bytes),
+            "bytes": type_ii_size,
         },
         "management_review": {
             "filename": management_review.filename,
-            "bytes": len(management_bytes),
+            "bytes": management_size,
         },
         "soc1_output": {
             "status": "processing",
@@ -200,23 +278,7 @@ def get_status(job_id: str) -> dict[str, Any]:
         return {"error": "Job not found", "job_id": job_id}
 
     status = job_status[job_id].copy()
-
-    # Add analysis preview if completed
-    if status.get("status") == "completed" and status.get("result"):
-        analysis = status["result"].get("analysis", {})
-        status["analysis_summary"] = {
-            "total_controls": analysis.get("total_controls_identified", "N/A"),
-            "exceptions": analysis.get("controls_with_exceptions", "N/A"),
-            "total_cuecs": analysis.get("total_cuecs_identified", "N/A"),
-            "cells_needing_review": analysis.get("cells_needing_review", {
-                "low_confidence": 0,
-                "medium_confidence": 0,
-            }),
-            "summary": analysis.get("summary", ""),
-            "key_findings": analysis.get("key_findings", [])[:5],
-            "cuec_findings": analysis.get("cuec_findings", [])[:5],
-        }
-
+    # analysis_summary is already pre-computed and stored directly in job_status
     return status
 
 
@@ -230,18 +292,17 @@ def download_result(job_id: str):
     if status.get("status") != "completed":
         return {"error": "Job not completed yet", "status": status.get("status")}
 
-    # MEMORY FIX: Read from disk instead of memory
-    file_path = status.get("output_path")
-    if not file_path or not Path(file_path).exists():
-        return {"error": "Generated file not found on disk"}
+    file_path = job_files.get(job_id)
+    if file_path is None or not file_path.exists():
+        return {"error": "Generated file not found"}
 
     filename = status.get("output_filename", "soc1_management_review.xlsx")
 
-    # Return the file as a streaming response (reads from disk, not memory)
-    return StreamingResponse(
-        open(file_path, "rb"),
+    # Serve directly from disk — no need to load into memory
+    return FileResponse(
+        path=str(file_path),
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        headers={"Content-Disposition": f"attachment; filename={filename}"},
+        filename=filename,
     )
 
 
@@ -252,17 +313,17 @@ async def submit_feedback(
 ) -> dict[str, Any]:
     """
     Submit feedback for a completed job.
-    
+
     Args:
         job_id: The job ID to provide feedback for
         feedback: Feedback data including rating, text, and issues
     """
     if job_id not in job_status:
         return {"error": "Job not found"}
-    
+
     feedback_dir = Path("feedback")
     feedback_dir.mkdir(exist_ok=True)
-    
+
     # Store feedback metadata
     feedback_data = {
         "job_id": job_id,
@@ -276,21 +337,21 @@ async def submit_feedback(
             "analysis_summary": job_status[job_id].get("analysis_summary"),
         },
     }
-    
+
     # Append feedback to JSON log
     feedback_log = feedback_dir / "feedback_log.json"
-    
+
     if feedback_log.exists():
         with open(feedback_log, "r") as f:
             all_feedback = json.load(f)
     else:
         all_feedback = []
-    
+
     all_feedback.append(feedback_data)
-    
+
     with open(feedback_log, "w") as f:
         json.dump(all_feedback, f, indent=2)
-    
+
     return {
         "status": "success",
         "message": "Thank you for your feedback! This helps us improve the extraction quality.",
@@ -303,34 +364,34 @@ def get_feedback_stats() -> dict[str, Any]:
     """Get aggregated feedback statistics (for admin/monitoring)."""
     feedback_dir = Path("feedback")
     feedback_log = feedback_dir / "feedback_log.json"
-    
+
     if not feedback_log.exists():
         return {
             "total_feedback": 0,
             "average_rating": 0,
             "common_issues": {},
         }
-    
+
     with open(feedback_log, "r") as f:
         all_feedback = json.load(f)
-    
+
     if not all_feedback:
         return {
             "total_feedback": 0,
             "average_rating": 0,
             "common_issues": {},
         }
-    
+
     # Calculate statistics
     total = len(all_feedback)
     avg_rating = sum(f["rating"] for f in all_feedback) / total
-    
+
     # Count issue frequencies
     issue_counts: dict[str, int] = {}
     for feedback in all_feedback:
         for issue in feedback.get("issues", []):
             issue_counts[issue] = issue_counts.get(issue, 0) + 1
-    
+
     return {
         "total_feedback": total,
         "average_rating": round(avg_rating, 2),
@@ -342,20 +403,18 @@ def get_feedback_stats() -> dict[str, Any]:
 @app.post("/api/cleanup-uploads")
 def cleanup_uploads() -> dict[str, Any]:
     """Manually clear all files in the uploads folder."""
-    import shutil
-    
     upload_root = Path("uploads")
-    
+
     if not upload_root.exists():
         return {
             "status": "success",
             "message": "Uploads folder does not exist",
             "files_deleted": 0,
         }
-    
+
     files_deleted = 0
     errors = []
-    
+
     try:
         for file_path in upload_root.iterdir():
             if file_path.is_file():
@@ -364,7 +423,7 @@ def cleanup_uploads() -> dict[str, Any]:
                     files_deleted += 1
                 except Exception as e:
                     errors.append(f"Failed to delete {file_path.name}: {str(e)}")
-        
+
         return {
             "status": "success",
             "message": f"Deleted {files_deleted} file(s) from uploads folder",

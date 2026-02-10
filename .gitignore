@@ -19,8 +19,10 @@ pip-wheel-metadata/
 dist/
 build/
 
-# FastAPI / uploads
+# FastAPI / uploads and generated files
 uploads/
+output_files/
+test_output/
 
 # Node / Vite
 node_modules/
