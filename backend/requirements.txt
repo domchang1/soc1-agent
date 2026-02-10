@@ -5,3 +5,4 @@ python-dotenv
 pdfplumber
 openpyxl
 google-genai
+psutil
