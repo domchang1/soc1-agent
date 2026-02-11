@@ -454,8 +454,8 @@ def cleanup_old_files(max_age_hours: int = 24) -> dict[str, Any]:
     
     try:
         # Clean old output files
-        if output_dir.exists():
-            for file_path in output_dir.iterdir():
+        if OUTPUT_DIR.exists():
+            for file_path in OUTPUT_DIR.iterdir():
                 if file_path.is_file():
                     try:
                         if file_path.stat().st_mtime < cutoff_time:
@@ -464,11 +464,14 @@ def cleanup_old_files(max_age_hours: int = 24) -> dict[str, Any]:
                     except Exception as e:
                         errors.append(f"Failed to delete {file_path.name}: {str(e)}")
         
-        # Clean old job status entries
+        # Clean old job status entries (created_at format: %Y%m%d%H%M%S)
         old_jobs = [
             job_id for job_id, status in job_status.items()
-            if status.get("created_at") and 
-            datetime.fromisoformat(status["created_at"]).timestamp() < cutoff_time
+            if status.get("created_at")
+            and datetime.strptime(status["created_at"], "%Y%m%d%H%M%S")
+            .replace(tzinfo=timezone.utc)
+            .timestamp()
+            < cutoff_time
         ]
         for job_id in old_jobs:
             del job_status[job_id]

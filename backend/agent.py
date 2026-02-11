@@ -16,7 +16,7 @@ import os
 import re
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional
 
 import psutil
 from google import genai
@@ -138,19 +138,19 @@ class ExcelHandler:
     """Handles reading and writing Excel files using openpyxl."""
 
     @staticmethod
-    def read_template(excel_path: Path) -> tuple[openpyxl.Workbook, ExcelTemplate]:
+    def read_template(excel_path: Path) -> tuple[None, ExcelTemplate]:
         """
-        Read an Excel template and extract its structure.
-        Detects whether each sheet is a "form" (questionnaire) or "table" (tabular data).
+        Read an Excel template and extract its structure using read_only mode.
+        OOM FIX: Uses streaming to avoid loading the full workbook (~50x file size).
+        Returns (None, template) - fill_template creates output from scratch.
 
         Args:
             excel_path: Path to the Excel file
 
         Returns:
-            Tuple of (workbook, ExcelTemplate)
+            Tuple of (None, ExcelTemplate)
         """
-        wb = openpyxl.load_workbook(excel_path, data_only=True)
-        sheet_names = wb.sheetnames
+        sheet_names: list[str] = []
         headers: dict[str, list[str]] = {}
         header_to_col: dict[str, dict[str, int]] = {}
         header_rows: dict[str, int] = {}
@@ -158,109 +158,93 @@ class ExcelHandler:
         sheet_types: dict[str, str] = {}
         form_fields: dict[str, list[dict[str, Any]]] = {}
 
-        for sheet_name in sheet_names:
-            ws = wb[sheet_name]
-            sheet_headers: list[str] = []
-            sheet_header_to_col: dict[str, int] = {}
-            sheet_structure: list[dict[str, Any]] = []
-            sheet_form_fields: list[dict[str, Any]] = []
+        # read_only: streaming, near-constant memory
+        wb = openpyxl.load_workbook(
+            excel_path, read_only=True, data_only=True, keep_vba=False, keep_links=False
+        )
+        try:
+            sheet_names = wb.sheetnames
+            for sheet_name in sheet_names:
+                ws = wb[sheet_name]
+                sheet_headers: list[str] = []
+                sheet_header_to_col: dict[str, int] = {}
+                sheet_form_fields: list[dict[str, Any]] = []
 
-            # Analyze sheet structure to determine if it's a form or table
-            # Count how many rows have content only in column A (form-like)
-            form_like_rows = 0
-            table_like_rows = 0
-            best_header_row = None
-            best_header_count = 0
-            
-            for row_idx in range(1, min(30, ws.max_row + 1)):
-                row_values = []
-                for col in range(1, min(15, ws.max_column + 1)):
-                    val = ws.cell(row=row_idx, column=col).value
-                    if val is not None:
-                        row_values.append((col, val))
-                
-                if len(row_values) == 1 and row_values[0][0] == 1:
-                    # Only column A has content - form-like
-                    form_like_rows += 1
-                elif len(row_values) >= 3:
-                    # Multiple columns have content - could be header row
-                    table_like_rows += 1
-                    if len(row_values) > best_header_count:
-                        best_header_count = len(row_values)
-                        best_header_row = row_idx
+                # Collect first 100 rows in one pass (read_only iterates once)
+                rows_by_idx: dict[int, list[Any]] = {}
+                for row_idx, row in enumerate(
+                    ws.iter_rows(min_row=1, max_row=100, max_col=50, values_only=True), 1
+                ):
+                    rows_by_idx[row_idx] = list(row) if row else []
 
-            # Determine sheet type
-            is_form = form_like_rows > table_like_rows * 2
-            sheet_types[sheet_name] = "form" if is_form else "table"
-            
-            if is_form:
-                # Extract form fields from column A
-                for row_idx in range(1, min(100, ws.max_row + 1)):
-                    label = ws.cell(row=row_idx, column=1).value
-                    if label and isinstance(label, str) and len(label.strip()) > 0:
-                        # Check if this row has any existing data in other columns
-                        existing_values = {}
-                        for col in range(2, min(10, ws.max_column + 1)):
-                            val = ws.cell(row=row_idx, column=col).value
-                            if val is not None:
-                                existing_values[col] = val
-                        
-                        sheet_form_fields.append({
-                            "row": row_idx,
-                            "label": label.strip(),
-                            "answer_col": 2,  # Default answer column is B
-                            "existing": existing_values,
-                        })
-                
-                form_fields[sheet_name] = sheet_form_fields
-                # For forms, create pseudo-headers based on common answer columns
-                sheet_headers = ["Label", "Answer", "Notes", "Reference"]
-                for i, h in enumerate(sheet_headers, 1):
-                    sheet_header_to_col[h] = i
-                    sheet_header_to_col[h.lower()] = i
-                found_header_row = 1
-                
-            else:
-                # Table sheet - find the best header row
-                found_header_row = best_header_row or 1
-                
-                # Extract headers from the identified row
-                for col_idx in range(1, ws.max_column + 1):
-                    v = ws.cell(row=found_header_row, column=col_idx).value
-                    header_name = str(v).strip() if v else f"Column_{col_idx}"
-                    # Clean up header names (remove newlines, extra spaces)
-                    header_name = ' '.join(header_name.split())
-                    sheet_headers.append(header_name)
-                    sheet_header_to_col[header_name] = col_idx
-                    sheet_header_to_col[header_name.lower()] = col_idx
-                    # Also map without special characters for fuzzy matching
-                    clean_name = ''.join(c for c in header_name.lower() if c.isalnum() or c.isspace())
-                    sheet_header_to_col[clean_name] = col_idx
+                form_like_rows = sum(
+                    1
+                    for r in range(1, min(31, len(rows_by_idx) + 1))
+                    if rows_by_idx.get(r)
+                    and len([v for v in rows_by_idx[r] if v is not None]) == 1
+                    and (rows_by_idx[r][0] is not None if rows_by_idx[r] else False)
+                )
+                table_like_rows = sum(
+                    1
+                    for r in range(1, min(31, len(rows_by_idx) + 1))
+                    if rows_by_idx.get(r)
+                    and len([v for v in rows_by_idx[r] if v is not None]) >= 3
+                )
+                best_header_row = None
+                best_header_count = 0
+                for r in range(1, min(31, len(rows_by_idx) + 1)):
+                    row = rows_by_idx.get(r, [])
+                    n = len([v for v in row if v is not None])
+                    if n >= 3 and n > best_header_count:
+                        best_header_count = n
+                        best_header_row = r
 
-            headers[sheet_name] = sheet_headers
-            header_to_col[sheet_name] = sheet_header_to_col
-            header_rows[sheet_name] = found_header_row
+                is_form = form_like_rows > table_like_rows * 2
+                sheet_types[sheet_name] = "form" if is_form else "table"
 
-            # Extract existing data structure (for context to AI)
-            if not is_form:
-                for row_idx in range(found_header_row + 1, min(found_header_row + 100, ws.max_row + 1)):
-                    row_data: dict[str, Any] = {"_row": row_idx}
-                    has_data = False
-                    for col_idx, header in enumerate(sheet_headers, 1):
-                        cell = ws.cell(row=row_idx, column=col_idx)
-                        row_data[header] = {
-                            "value": cell.value,
-                            "column": col_idx,
-                            "row": row_idx,
-                        }
-                        if cell.value is not None:
-                            has_data = True
-                    if has_data:
-                        sheet_structure.append(row_data)
+                if is_form:
+                    for row_idx in range(1, min(100, len(rows_by_idx) + 1)):
+                        row = rows_by_idx.get(row_idx, [])
+                        label = row[0] if len(row) > 0 else None
+                        if label and isinstance(label, str) and len(label.strip()) > 0:
+                            existing_values = {}
+                            for col in range(1, min(9, len(row))):
+                                if len(row) > col and row[col] is not None:
+                                    existing_values[col + 2] = row[col]
+                            sheet_form_fields.append({
+                                "row": row_idx,
+                                "label": label.strip(),
+                                "answer_col": 2,
+                                "existing": existing_values,
+                            })
+                    form_fields[sheet_name] = sheet_form_fields
+                    sheet_headers = ["Label", "Answer", "Notes", "Reference"]
+                    for i, h in enumerate(sheet_headers, 1):
+                        sheet_header_to_col[h] = i
+                        sheet_header_to_col[h.lower()] = i
+                    header_rows[sheet_name] = 1
+                else:
+                    found_header_row = best_header_row or 1
+                    header_row_data = rows_by_idx.get(found_header_row, [])
+                    for col_idx, v in enumerate(header_row_data, 1):
+                        header_name = str(v).strip() if v else f"Column_{col_idx}"
+                        header_name = " ".join(header_name.split())
+                        sheet_headers.append(header_name)
+                        sheet_header_to_col[header_name] = col_idx
+                        sheet_header_to_col[header_name.lower()] = col_idx
+                        clean_name = "".join(
+                            c for c in header_name.lower() if c.isalnum() or c.isspace()
+                        )
+                        sheet_header_to_col[clean_name] = col_idx
+                    header_rows[sheet_name] = found_header_row
 
-            structure[sheet_name] = sheet_structure
+                headers[sheet_name] = sheet_headers
+                header_to_col[sheet_name] = sheet_header_to_col
+                structure[sheet_name] = []
+        finally:
+            wb.close()
 
-        return wb, ExcelTemplate(
+        return None, ExcelTemplate(
             filepath=excel_path,
             sheet_names=sheet_names,
             headers=headers,
@@ -273,16 +257,17 @@ class ExcelHandler:
 
     @staticmethod
     def fill_template(
-        wb: openpyxl.Workbook,
+        wb: Optional[openpyxl.Workbook],
         template: ExcelTemplate,
         mappings: dict[str, list[dict[str, Any]]],
         output_path: Path,
     ) -> Path:
         """
         Fill the Excel template with mapped data and apply confidence-based coloring.
+        When wb is None (read_only extraction), creates output workbook from scratch.
 
         Args:
-            wb: The workbook to fill
+            wb: The workbook to fill, or None to create from scratch
             template: The ExcelTemplate with header mappings
             mappings: Dict of sheet_name -> list of row updates
             output_path: Path to save the filled template
@@ -295,6 +280,52 @@ class ExcelHandler:
             - Medium confidence: Light yellow background
             - Low confidence: Light red background (missing info)
         """
+        if wb is None:
+            return ExcelHandler._fill_template_from_scratch(template, mappings, output_path)
+
+        return ExcelHandler._fill_template_into_workbook(wb, template, mappings, output_path)
+
+    @staticmethod
+    def _fill_template_from_scratch(
+        template: ExcelTemplate,
+        mappings: dict[str, list[dict[str, Any]]],
+        output_path: Path,
+    ) -> Path:
+        """Create output workbook from scratch (OOM fix: no template load)."""
+        wb = openpyxl.Workbook()
+        # Remove default sheet; we'll create sheets from template
+        if "Sheet" in wb.sheetnames:
+            del wb["Sheet"]
+
+        # Create sheets for each template sheet (preserve order)
+        for sheet_name in template.sheet_names:
+            wb.create_sheet(title=sheet_name)
+
+        # Write headers and form labels
+        for sheet_name in template.sheet_names:
+            ws = wb[sheet_name]
+            header_row = template.header_row.get(sheet_name, 1)
+            headers = template.headers.get(sheet_name, [])
+            sheet_type = template.sheet_type.get(sheet_name, "table")
+
+            if sheet_type == "form":
+                for field in template.form_fields.get(sheet_name, []):
+                    ws.cell(row=field["row"], column=1, value=field["label"])
+            else:
+                for col_idx, header in enumerate(headers, 1):
+                    ws.cell(row=header_row, column=col_idx, value=header)
+
+        # Fill with mappings (same logic as _fill_template_into_workbook)
+        return ExcelHandler._fill_template_into_workbook(wb, template, mappings, output_path)
+
+    @staticmethod
+    def _fill_template_into_workbook(
+        wb: openpyxl.Workbook,
+        template: ExcelTemplate,
+        mappings: dict[str, list[dict[str, Any]]],
+        output_path: Path,
+    ) -> Path:
+        """Fill an existing workbook with mappings."""
         print(f"\n{'='*60}")
         print(f"FILL_TEMPLATE DEBUG")
         print(f"{'='*60}")
@@ -1054,9 +1085,10 @@ async def process_soc1_documents(
     print(f"  - Saved to: {output_path}")
     log_memory("after workbook save")
 
-    # Free the workbook now that it's saved to disk
-    workbook.close()
-    del workbook
+    # workbook is None when using read_only + from-scratch fill (OOM fix)
+    if workbook is not None:
+        workbook.close()
+        del workbook
     gc.collect()
     log_memory("after workbook freed")
 
