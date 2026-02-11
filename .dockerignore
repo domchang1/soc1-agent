@@ -1,0 +1,17 @@
+# OOM debug: keep image small
+.git
+.gitignore
+*.md
+.env
+.env.*
+frontend/
+__pycache__
+*.pyc
+.venv
+venv
+uploads/
+output_files/
+feedback/
+test_output/
+*.log
+.DS_Store

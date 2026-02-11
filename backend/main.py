@@ -17,6 +17,11 @@ from agent import process_soc1_documents, log_memory
 
 app = FastAPI(title="SOC 1 Generator API")
 
+# OOM debug: high-frequency memory logging when ENABLE_MEM_LOG=1
+if os.environ.get("ENABLE_MEM_LOG"):
+    from memlog import start_mem_logger
+    start_mem_logger(interval_s=0.5)
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["http://localhost:5173", "https://soc1-agent.vercel.app"],
