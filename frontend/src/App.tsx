@@ -45,6 +45,7 @@ export default function App() {
   const [feedbackText, setFeedbackText] = useState("");
   const [feedbackIssues, setFeedbackIssues] = useState<string[]>([]);
   const [feedbackSubmitted, setFeedbackSubmitted] = useState(false);
+  const [hoveredStar, setHoveredStar] = useState(0);
   const pollingRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
   const canSubmit = useMemo(
@@ -351,6 +352,7 @@ ${summary?.cuec_findings && summary.cuec_findings.length > 0 ? `
     setFeedbackText("");
     setFeedbackIssues([]);
     setFeedbackSubmitted(false);
+    setHoveredStar(0);
 
     if (pollingRef.current) {
       clearInterval(pollingRef.current);
@@ -457,8 +459,10 @@ ${summary?.cuec_findings && summary.cuec_findings.length > 0 ? `
                 <button
                   key={star}
                   type="button"
-                  className={`star ${feedbackRating >= star ? "filled" : ""}`}
+                  className={`star ${feedbackRating >= star || hoveredStar >= star ? "filled" : ""}`}
                   onClick={() => setFeedbackRating(star)}
+                  onMouseEnter={() => setHoveredStar(star)}
+                  onMouseLeave={() => setHoveredStar(0)}
                 >
                   ★
                 </button>

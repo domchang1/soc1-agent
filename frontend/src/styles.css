@@ -413,8 +413,8 @@ input[type="file"]:disabled::file-selector-button {
   transition: color 0.2s ease, transform 0.2s ease;
 }
 
-.star:hover,
-.star.filled {
+.star.filled,
+.star.hovered {
   color: #fbbf24;
   transform: scale(1.1);
 }
