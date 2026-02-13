@@ -14,9 +14,11 @@ import gc
 import json
 import os
 import re
-from dataclasses import dataclass
+import xml.etree.ElementTree as ET
+import zipfile
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any
 
 import psutil
 from google import genai
@@ -24,7 +26,8 @@ from google.genai import types
 import openpyxl
 import pdfplumber
 from dotenv import load_dotenv
-from openpyxl.styles import PatternFill
+
+# xlsxwriter imported locally in fill_template() to avoid startup cost
 
 
 def log_memory(label: str) -> float:
@@ -34,10 +37,10 @@ def log_memory(label: str) -> float:
     print(f"[MEMORY] {label}: {rss_mb:.1f} MB RSS")
     return rss_mb
 
-# Confidence level color fills
-FILL_HIGH_CONFIDENCE = None  # No fill - confident
-FILL_MEDIUM_CONFIDENCE = PatternFill(start_color="FFFFCC", end_color="FFFFCC", fill_type="solid")  # Light yellow
-FILL_LOW_CONFIDENCE = PatternFill(start_color="FFCCCC", end_color="FFCCCC", fill_type="solid")  # Light red
+# XML namespaces used when parsing XLSX internals
+_SSML = "{http://schemas.openxmlformats.org/spreadsheetml/2006/main}"
+_REL = "{http://schemas.openxmlformats.org/package/2006/relationships}"
+_ROFF = "{http://schemas.openxmlformats.org/officeDocument/2006/relationships}"
 
 load_dotenv()
 
@@ -66,14 +69,14 @@ class ExcelTemplate:
     header_to_col: dict[str, dict[str, int]]  # sheet_name -> {header: col_index}
     header_row: dict[str, int]  # sheet_name -> header row number
     structure: dict[str, list[dict[str, Any]]]  # sheet_name -> list of row dicts
-    sheet_type: dict[str, str] = None  # sheet_name -> "form" or "table"
-    form_fields: dict[str, list[dict[str, Any]]] = None  # sheet_name -> list of form fields
-    
-    def __post_init__(self):
-        if self.sheet_type is None:
-            self.sheet_type = {}
-        if self.form_fields is None:
-            self.form_fields = {}
+    sheet_type: dict[str, str] = field(default_factory=dict)  # "form" or "table"
+    form_fields: dict[str, list[dict[str, Any]]] = field(default_factory=dict)
+    # Layout info captured from ZIP for xlsxwriter output
+    column_widths: dict[str, dict[int, float]] = field(default_factory=dict)
+    merged_ranges: dict[str, list[str]] = field(default_factory=dict)
+    existing_cells: dict[str, dict[tuple[int, int], Any]] = field(default_factory=dict)
+    max_row: dict[str, int] = field(default_factory=dict)
+    max_col: dict[str, int] = field(default_factory=dict)
 
 
 class PDFExtractor:
@@ -135,17 +138,157 @@ class PDFExtractor:
 
 
 class ExcelHandler:
-    """Handles reading and writing Excel files using openpyxl."""
+    """Handles reading and writing Excel files.
+
+    Read phase:  openpyxl read_only  (streaming, ~constant memory)
+    Write phase: xlsxwriter          (forward-only, ~constant memory)
+
+    The XLSX ZIP is parsed directly for column widths and merged cells,
+    avoiding the need to ever open the workbook in writable mode with
+    openpyxl (which can use 50x the file size in RAM).
+    """
+
+    # ── helpers ──────────────────────────────────────────────────────
 
     @staticmethod
-    def read_template(excel_path: Path) -> tuple[None, ExcelTemplate]:
+    def _ref_to_rowcol(ref: str) -> tuple[int, int]:
+        """Convert Excel cell reference like 'A1' to 1-based (row, col)."""
+        col_str = ""
+        row_str = ""
+        for c in ref:
+            if c.isalpha():
+                col_str += c
+            else:
+                row_str += c
+        col = 0
+        for c in col_str.upper():
+            col = col * 26 + (ord(c) - ord('A') + 1)
+        return int(row_str), col
+
+    @staticmethod
+    def _parse_range(range_ref: str) -> tuple[int, int, int, int]:
+        """Parse 'A1:B3' into (first_row, first_col, last_row, last_col) 1-based."""
+        parts = range_ref.split(":")
+        r1, c1 = ExcelHandler._ref_to_rowcol(parts[0])
+        r2, c2 = ExcelHandler._ref_to_rowcol(parts[1]) if len(parts) > 1 else (r1, c1)
+        return r1, c1, r2, c2
+
+    @staticmethod
+    def _match_sheet_name(
+        ai_name: str, template_names: list[str]
+    ) -> str | None:
+        """Fuzzy-match an AI-returned sheet name to a template sheet name."""
+        # Exact match
+        if ai_name in template_names:
+            return ai_name
+        ai_lower = ai_name.lower()
+        for tpl_name in template_names:
+            tpl_lower = tpl_name.lower()
+            # Substring match (either direction)
+            if ai_lower in tpl_lower or tpl_lower in ai_lower:
+                return tpl_name
+            # Keyword match
+            for kw in ("management review", "user entity", "cuec", "comp user"):
+                if kw in ai_lower and kw in tpl_lower:
+                    return tpl_name
+        return None
+
+    # ── ZIP layout parser (streaming, low memory) ────────────────────
+
+    @staticmethod
+    def _parse_layout_from_zip(
+        excel_path: Path,
+        target_sheet_names: list[str],
+    ) -> tuple[dict[str, dict[int, float]], dict[str, list[str]]]:
         """
-        Read an Excel template and extract its structure using read_only mode.
-        OOM FIX: Uses streaming to avoid loading the full workbook (~50x file size).
-        Returns (None, template) - fill_template creates output from scratch.
+        Parse column widths and merged cells directly from the XLSX ZIP
+        using streaming XML (iterparse).  Never loads the full sheet DOM
+        into memory, so even very large sheets use only a few MB.
+        """
+        column_widths: dict[str, dict[int, float]] = {}
+        merged_ranges: dict[str, list[str]] = {}
+
+        try:
+            with zipfile.ZipFile(excel_path, "r") as zf:
+                # Map sheet names ➜ XML file paths inside the ZIP
+                wb_bytes = zf.read("xl/workbook.xml")
+                wb_root = ET.fromstring(wb_bytes)
+                del wb_bytes
+                sheets_el = wb_root.find(f"{_SSML}sheets")
+                if sheets_el is None:
+                    return column_widths, merged_ranges
+
+                sheet_rid: dict[str, str] = {}
+                for s in sheets_el.findall(f"{_SSML}sheet"):
+                    name = s.get("name")
+                    rid = s.get(f"{_ROFF}id")
+                    if name in target_sheet_names and rid:
+                        sheet_rid[name] = rid
+                del wb_root
+
+                rels_bytes = zf.read("xl/_rels/workbook.xml.rels")
+                rels_root = ET.fromstring(rels_bytes)
+                del rels_bytes
+                rid_to_path: dict[str, str] = {}
+                for rel in rels_root.findall(f"{_REL}Relationship"):
+                    rid_to_path[rel.get("Id")] = rel.get("Target")
+                del rels_root
+
+                # Stream-parse each target sheet's XML
+                for sheet_name, rid in sheet_rid.items():
+                    target = rid_to_path.get(rid)
+                    if not target:
+                        continue
+                    xml_path = f"xl/{target}" if not target.startswith("/") else target.lstrip("/")
+                    if xml_path not in zf.namelist():
+                        continue
+
+                    widths: dict[int, float] = {}
+                    merges: list[str] = []
+
+                    with zf.open(xml_path) as f:
+                        for event, elem in ET.iterparse(f, events=("end",)):
+                            tag = elem.tag
+                            if tag == f"{_SSML}col":
+                                min_c = int(elem.get("min", "1"))
+                                max_c = int(elem.get("max", str(min_c)))
+                                w = float(elem.get("width", "8.43"))
+                                for c in range(min_c, min(max_c + 1, 51)):
+                                    widths[c] = w
+                                elem.clear()
+                            elif tag == f"{_SSML}mergeCell":
+                                ref = elem.get("ref")
+                                if ref:
+                                    merges.append(ref)
+                                elem.clear()
+                            elif tag in (f"{_SSML}row", f"{_SSML}sheetData",
+                                         f"{_SSML}cols", f"{_SSML}mergeCells"):
+                                elem.clear()
+
+                    column_widths[sheet_name] = widths
+                    merged_ranges[sheet_name] = merges
+        except Exception as e:
+            print(f"Warning: Could not parse XLSX layout from ZIP: {e}")
+
+        return column_widths, merged_ranges
+
+    # ── read_template ────────────────────────────────────────────────
+
+    @staticmethod
+    def read_template(
+        excel_path: Path,
+        target_tabs: list[str] | None = None,
+    ) -> tuple[None, ExcelTemplate]:
+        """
+        Read an Excel template using read_only mode (streaming, constant memory).
+
+        Also parses column widths and merged cells directly from the ZIP.
+        Returns (None, template) — fill_template writes via xlsxwriter.
 
         Args:
             excel_path: Path to the Excel file
+            target_tabs: Optional substrings to filter sheet names
+                         (e.g. ["1.0", "2.0.b"])
 
         Returns:
             Tuple of (None, ExcelTemplate)
@@ -157,26 +300,58 @@ class ExcelHandler:
         structure: dict[str, list[dict[str, Any]]] = {}
         sheet_types: dict[str, str] = {}
         form_fields: dict[str, list[dict[str, Any]]] = {}
+        all_existing_cells: dict[str, dict[tuple[int, int], Any]] = {}
+        max_rows: dict[str, int] = {}
+        max_cols: dict[str, int] = {}
 
-        # read_only: streaming, near-constant memory
+        # ── Phase 1: openpyxl read_only for structure + cell values ──
         wb = openpyxl.load_workbook(
-            excel_path, read_only=True, data_only=True, keep_vba=False, keep_links=False
+            excel_path, read_only=True, data_only=True,
+            keep_vba=False, keep_links=False,
         )
         try:
-            sheet_names = wb.sheetnames
+            all_sheet_names = wb.sheetnames
+
+            # Filter to target tabs
+            if target_tabs:
+                sheet_names = [
+                    n for n in all_sheet_names
+                    if any(pat.lower() in n.lower() for pat in target_tabs)
+                ]
+                skipped = set(all_sheet_names) - set(sheet_names)
+                for s in skipped:
+                    print(f"  Skipping non-target sheet '{s}'")
+            else:
+                sheet_names = list(all_sheet_names)
+
             for sheet_name in sheet_names:
                 ws = wb[sheet_name]
                 sheet_headers: list[str] = []
                 sheet_header_to_col: dict[str, int] = {}
                 sheet_form_fields: list[dict[str, Any]] = []
+                cells: dict[tuple[int, int], Any] = {}
+                max_r = 0
+                max_c = 0
 
-                # Collect first 100 rows in one pass (read_only iterates once)
+                # Single pass: capture all cells (up to 500 rows, 50 cols)
                 rows_by_idx: dict[int, list[Any]] = {}
                 for row_idx, row in enumerate(
-                    ws.iter_rows(min_row=1, max_row=100, max_col=50, values_only=True), 1
+                    ws.iter_rows(min_row=1, max_row=500, max_col=50,
+                                 values_only=True), 1
                 ):
-                    rows_by_idx[row_idx] = list(row) if row else []
+                    row_list = list(row) if row else []
+                    rows_by_idx[row_idx] = row_list
+                    for col_idx, val in enumerate(row_list, 1):
+                        if val is not None:
+                            cells[(row_idx, col_idx)] = val
+                            max_r = max(max_r, row_idx)
+                            max_c = max(max_c, col_idx)
 
+                all_existing_cells[sheet_name] = cells
+                max_rows[sheet_name] = max_r
+                max_cols[sheet_name] = max_c
+
+                # ── Detect form vs table (first 30 rows) ──
                 form_like_rows = sum(
                     1
                     for r in range(1, min(31, len(rows_by_idx) + 1))
@@ -203,7 +378,7 @@ class ExcelHandler:
                 sheet_types[sheet_name] = "form" if is_form else "table"
 
                 if is_form:
-                    for row_idx in range(1, min(100, len(rows_by_idx) + 1)):
+                    for row_idx in range(1, min(500, len(rows_by_idx) + 1)):
                         row = rows_by_idx.get(row_idx, [])
                         label = row[0] if len(row) > 0 else None
                         if label and isinstance(label, str) and len(label.strip()) > 0:
@@ -233,7 +408,8 @@ class ExcelHandler:
                         sheet_header_to_col[header_name] = col_idx
                         sheet_header_to_col[header_name.lower()] = col_idx
                         clean_name = "".join(
-                            c for c in header_name.lower() if c.isalnum() or c.isspace()
+                            c for c in header_name.lower()
+                            if c.isalnum() or c.isspace()
                         )
                         sheet_header_to_col[clean_name] = col_idx
                     header_rows[sheet_name] = found_header_row
@@ -243,6 +419,14 @@ class ExcelHandler:
                 structure[sheet_name] = []
         finally:
             wb.close()
+        del wb
+        gc.collect()
+
+        # ── Phase 2: Parse layout from ZIP (column widths, merges) ──
+        col_widths, merge_ranges = ExcelHandler._parse_layout_from_zip(
+            excel_path, sheet_names,
+        )
+        log_memory("after ZIP layout parse")
 
         return None, ExcelTemplate(
             filepath=excel_path,
@@ -253,252 +437,240 @@ class ExcelHandler:
             structure=structure,
             sheet_type=sheet_types,
             form_fields=form_fields,
+            column_widths=col_widths,
+            merged_ranges=merge_ranges,
+            existing_cells=all_existing_cells,
+            max_row=max_rows,
+            max_col=max_cols,
         )
+
+    # ── fill_template (xlsxwriter) ───────────────────────────────────
 
     @staticmethod
     def fill_template(
-        wb: Optional[openpyxl.Workbook],
         template: ExcelTemplate,
         mappings: dict[str, list[dict[str, Any]]],
         output_path: Path,
     ) -> Path:
         """
-        Fill the Excel template with mapped data and apply confidence-based coloring.
-        When wb is None (read_only extraction), creates output workbook from scratch.
+        Write a new Excel file with xlsxwriter, reproducing the template
+        layout (column widths, merged cells, existing labels/headers) and
+        overlaying the AI-extracted data with confidence-based coloring.
 
-        Args:
-            wb: The workbook to fill, or None to create from scratch
-            template: The ExcelTemplate with header mappings
-            mappings: Dict of sheet_name -> list of row updates
-            output_path: Path to save the filled template
-
-        Returns:
-            Path to the saved file
-
-        Color coding based on confidence:
-            - High confidence: No background color (default)
-            - Medium confidence: Light yellow background
-            - Low confidence: Light red background (missing info)
+        xlsxwriter writes forward-only, row-by-row, so memory usage stays
+        constant regardless of sheet size.
         """
-        if wb is None:
-            return ExcelHandler._fill_template_from_scratch(template, mappings, output_path)
+        import xlsxwriter
 
-        return ExcelHandler._fill_template_into_workbook(wb, template, mappings, output_path)
-
-    @staticmethod
-    def _fill_template_from_scratch(
-        template: ExcelTemplate,
-        mappings: dict[str, list[dict[str, Any]]],
-        output_path: Path,
-    ) -> Path:
-        """Create output workbook from scratch (OOM fix: no template load)."""
-        wb = openpyxl.Workbook()
-        # Remove default sheet; we'll create sheets from template
-        if "Sheet" in wb.sheetnames:
-            del wb["Sheet"]
-
-        # Create sheets for each template sheet (preserve order)
-        for sheet_name in template.sheet_names:
-            wb.create_sheet(title=sheet_name)
-
-        # Write headers and form labels
-        for sheet_name in template.sheet_names:
-            ws = wb[sheet_name]
-            header_row = template.header_row.get(sheet_name, 1)
-            headers = template.headers.get(sheet_name, [])
-            sheet_type = template.sheet_type.get(sheet_name, "table")
-
-            if sheet_type == "form":
-                for field in template.form_fields.get(sheet_name, []):
-                    ws.cell(row=field["row"], column=1, value=field["label"])
-            else:
-                for col_idx, header in enumerate(headers, 1):
-                    ws.cell(row=header_row, column=col_idx, value=header)
-
-        # Fill with mappings (same logic as _fill_template_into_workbook)
-        return ExcelHandler._fill_template_into_workbook(wb, template, mappings, output_path)
-
-    @staticmethod
-    def _fill_template_into_workbook(
-        wb: openpyxl.Workbook,
-        template: ExcelTemplate,
-        mappings: dict[str, list[dict[str, Any]]],
-        output_path: Path,
-    ) -> Path:
-        """Fill an existing workbook with mappings."""
         print(f"\n{'='*60}")
-        print(f"FILL_TEMPLATE DEBUG")
+        print("FILL_TEMPLATE (xlsxwriter)")
         print(f"{'='*60}")
-        print(f"Sheets in workbook: {wb.sheetnames}")
-        print(f"Mappings received for sheets: {list(mappings.keys())}")
+        print(f"Target sheets: {template.sheet_names}")
+        print(f"Mappings for: {list(mappings.keys())}")
         print(f"Sheet types: {template.sheet_type}")
-        
-        # Debug: Show what data we received
-        for sheet_name, rows in mappings.items():
-            print(f"\n--- Data for '{sheet_name}' ({len(rows)} rows) ---")
-            for i, row in enumerate(rows[:5]):  # Show first 5 rows
-                print(f"  Row {i}: {row}")
-        
-        for sheet_name, rows in mappings.items():
-            # Find matching sheet (exact or fuzzy match)
-            actual_sheet_name = None
-            if sheet_name in wb.sheetnames:
-                actual_sheet_name = sheet_name
-            else:
-                # Try fuzzy matching for common variations
-                sheet_name_lower = sheet_name.lower()
-                for ws_name in wb.sheetnames:
-                    if sheet_name_lower in ws_name.lower() or ws_name.lower() in sheet_name_lower:
-                        actual_sheet_name = ws_name
-                        break
-                    # Also try matching key parts like "management review" or "user entity"
-                    if "management review" in sheet_name_lower and "management review" in ws_name.lower():
-                        actual_sheet_name = ws_name
-                        break
-                    if "user entity" in sheet_name_lower and "user entity" in ws_name.lower():
-                        actual_sheet_name = ws_name
-                        break
-                    if "cuec" in sheet_name_lower and "cuec" in ws_name.lower():
-                        actual_sheet_name = ws_name
-                        break
 
-            if actual_sheet_name is None:
-                print(f"Warning: Sheet '{sheet_name}' not found in workbook. Available: {wb.sheetnames}")
-                continue
+        wb = xlsxwriter.Workbook(str(output_path))
 
-            print(f"\nProcessing sheet '{sheet_name}' -> actual: '{actual_sheet_name}' with {len(rows)} rows")
-            ws = wb[actual_sheet_name]
-            # Use the actual sheet name for header lookup
-            lookup_sheet_name = actual_sheet_name
-            header_map = template.header_to_col.get(lookup_sheet_name, {})
-            header_row = template.header_row.get(lookup_sheet_name, 1)
-            sheet_type = template.sheet_type.get(lookup_sheet_name, "table")
-            
-            print(f"  Sheet type: {sheet_type}")
-            print(f"  Header row: {header_row}")
-            print(f"  Header map keys: {list(header_map.keys())[:10]}...")
-            
-            # Normalize confidence values
-            def normalize_confidence(c):
-                if c in ("h", "high"):
-                    return "high"
-                elif c in ("m", "medium", "med"):
-                    return "medium"
-                elif c in ("l", "low"):
-                    return "low"
-                return "high"  # default
+        # ── Define reusable formats ──
+        header_fmt = wb.add_format({
+            "bold": True, "text_wrap": True, "valign": "top",
+            "border": 1, "bg_color": "#D9E1F2",
+        })
+        cell_fmt = wb.add_format({
+            "text_wrap": True, "valign": "top", "border": 1,
+        })
+        label_fmt = wb.add_format({
+            "bold": True, "text_wrap": True, "valign": "top",
+        })
+        low_conf_fmt = wb.add_format({
+            "text_wrap": True, "valign": "top", "border": 1,
+            "bg_color": "#FFCCCC",
+        })
+        med_conf_fmt = wb.add_format({
+            "text_wrap": True, "valign": "top", "border": 1,
+            "bg_color": "#FFFFCC",
+        })
 
-            for row_idx_in, row_update in enumerate(rows):
+        def normalize_confidence(c: Any) -> str:
+            if c in ("h", "high"):
+                return "high"
+            if c in ("m", "medium", "med"):
+                return "medium"
+            if c in ("l", "low"):
+                return "low"
+            return "high"
+
+        for sheet_name in template.sheet_names:
+            ws = wb.add_worksheet(sheet_name)
+            sheet_type = template.sheet_type.get(sheet_name, "table")
+            h_row = template.header_row.get(sheet_name, 1)
+            header_map = template.header_to_col.get(sheet_name, {})
+            existing = template.existing_cells.get(sheet_name, {})
+            max_r = template.max_row.get(sheet_name, 0)
+            max_c = template.max_col.get(sheet_name, 0)
+
+            # ── Set column widths ──
+            for col_1, width in template.column_widths.get(sheet_name, {}).items():
+                ws.set_column(col_1 - 1, col_1 - 1, width)
+
+            # ── Step A: Build AI cell overlay FIRST ──
+            # (must happen before merge writing so AI values can override)
+            ai_rows: list[dict[str, Any]] = []
+            matched = ExcelHandler._match_sheet_name(sheet_name, list(mappings.keys()))
+            if matched is None:
+                for ai_name in mappings:
+                    if ExcelHandler._match_sheet_name(ai_name, [sheet_name]):
+                        matched = ai_name
+                        break
+            if matched is not None:
+                ai_rows = mappings[matched]
+                print(f"\n  Sheet '{sheet_name}': {len(ai_rows)} AI rows from key '{matched}'")
+
+            ai_cells: dict[tuple[int, int], tuple[Any, str]] = {}
+            for row_idx_in, row_update in enumerate(ai_rows):
                 row_idx = row_update.get("_row")
                 if row_idx is None:
-                    print(f"    Row {row_idx_in}: No _row field, skipping. Data: {row_update}")
                     continue
-
-                cells_written = 0
                 confidence_map = row_update.get("_confidence", row_update.get("_c", {}))
-                row_confidence = row_update.get("_row_confidence", "high")
-                
-                # Handle form-style sheets differently
+                row_conf = row_update.get("_row_confidence", "high")
+
                 if sheet_type == "form":
-                    # For form sheets, write the "Answer" to column B at the specified row
                     answer = row_update.get("Answer") or row_update.get("answer")
                     if answer:
-                        cell = ws.cell(row=row_idx, column=2, value=answer)
-                        cells_written += 1
-                    # Also check for any other column data
+                        ai_cells[(row_idx, 2)] = (answer, normalize_confidence(row_conf))
                     for col_name, value in row_update.items():
                         if col_name.startswith("_") or col_name.lower() == "answer":
                             continue
                         if value and isinstance(value, str):
-                            # Try to map by column name
-                            col_idx = header_map.get(col_name) or header_map.get(col_name.lower())
-                            if col_idx:
-                                ws.cell(row=row_idx, column=col_idx, value=value)
-                                cells_written += 1
+                            cidx = header_map.get(col_name) or header_map.get(col_name.lower())
+                            if cidx:
+                                ai_cells[(row_idx, cidx)] = (value, normalize_confidence(row_conf))
                 else:
-                    # Table-style sheet - match by column headers
-                    # For table sheets, row should be after header row
-                    if row_idx <= header_row:
-                        row_idx = header_row + 1 + row_idx_in  # Auto-increment if row is invalid
-                    
+                    if row_idx <= h_row:
+                        row_idx = h_row + 1 + row_idx_in
                     for col_name, value in row_update.items():
                         if col_name.startswith("_"):
                             continue
-
-                        # Handle value with embedded confidence
                         cell_value = value
-                        raw_confidence = confidence_map.get(col_name, "high")
-                        cell_confidence = normalize_confidence(raw_confidence)
-
+                        raw_conf = confidence_map.get(col_name, "high")
+                        cell_conf = normalize_confidence(raw_conf)
                         if isinstance(value, dict):
                             cell_value = value.get("value", value.get("v"))
-                            raw_conf = value.get("confidence", value.get("c", raw_confidence))
-                            cell_confidence = normalize_confidence(raw_conf)
-
-                        # Skip if no value or empty string
+                            raw_conf = value.get("confidence", value.get("c", raw_conf))
+                            cell_conf = normalize_confidence(raw_conf)
                         if cell_value is None or cell_value == "":
                             continue
-
-                        # Find the column index for this header - try multiple matching strategies
-                        col_idx = None
-                        
-                        # Strategy 1: Exact match
-                        col_idx = header_map.get(col_name)
-                        
-                        # Strategy 2: Case-insensitive match
-                        if col_idx is None:
-                            col_idx = header_map.get(col_name.lower().strip())
-                        
-                        # Strategy 3: Partial match (for long header names)
-                        if col_idx is None:
-                            col_name_clean = col_name.lower().strip()
-                            for header_key, idx in header_map.items():
-                                if isinstance(header_key, str):
-                                    header_clean = header_key.lower().strip()
-                                    # Check if col_name is contained in header or vice versa
-                                    if col_name_clean in header_clean or header_clean in col_name_clean:
-                                        col_idx = idx
-                                        print(f"      Fuzzy match: '{col_name}' -> '{header_key}' (col {idx})")
-                                        break
-                        
-                        # Strategy 4: Match by key words
-                        if col_idx is None:
-                            col_words = set(col_name.lower().split())
-                            best_match_score = 0
-                            for header_key, idx in header_map.items():
-                                if isinstance(header_key, str):
-                                    header_words = set(header_key.lower().split())
-                                    common = col_words & header_words
-                                    if len(common) > best_match_score and len(common) >= 2:
-                                        best_match_score = len(common)
-                                        col_idx = idx
-
+                        col_idx = ExcelHandler._resolve_col(col_name, header_map)
                         if col_idx:
-                            cell = ws.cell(row=row_idx, column=col_idx, value=cell_value)
-                            cells_written += 1
+                            ai_cells[(row_idx, col_idx)] = (cell_value, cell_conf)
+                            max_r = max(max_r, row_idx)
+                            max_c = max(max_c, col_idx)
 
-                            # Apply confidence-based coloring
-                            if cell_confidence == "low":
-                                cell.fill = FILL_LOW_CONFIDENCE
-                            elif cell_confidence == "medium":
-                                cell.fill = FILL_MEDIUM_CONFIDENCE
-                        else:
-                            print(f"      Could not find column for '{col_name}' (value: {str(cell_value)[:50]}...)")
-                
-                if cells_written > 0:
-                    print(f"    Row {row_idx}: Wrote {cells_written} cells")
+            # ── Step B: Write merged ranges ──
+            # AI data overrides existing values for any merge whose top-left
+            # cell has an AI entry (e.g. form answer areas in the Mgmt Review).
+            merged_set: set[tuple[int, int]] = set()
+            cells_written_total = 0
+            for merge_ref in template.merged_ranges.get(sheet_name, []):
+                fr, fc, lr, lc = ExcelHandler._parse_range(merge_ref)
+                for mr in range(fr, lr + 1):
+                    for mc in range(fc, lc + 1):
+                        merged_set.add((mr, mc))
+
+                # Check if AI has data for ANY cell in this merge range.
+                # If so, use the first AI hit as the merge value.
+                ai_val = None
+                ai_conf = "high"
+                for mr in range(fr, lr + 1):
+                    for mc in range(fc, lc + 1):
+                        if (mr, mc) in ai_cells:
+                            ai_val, ai_conf = ai_cells[(mr, mc)]
+                            break
+                    if ai_val is not None:
+                        break
+
+                if ai_val is not None:
+                    val = ai_val
+                    if ai_conf == "low":
+                        fmt = low_conf_fmt
+                    elif ai_conf == "medium":
+                        fmt = med_conf_fmt
+                    else:
+                        fmt = cell_fmt
+                    cells_written_total += 1
                 else:
-                    print(f"    Row {row_idx}: No cells written! Data: {list(row_update.keys())}")
+                    val = existing.get((fr, fc), "")
+                    fmt = header_fmt if fr == h_row else cell_fmt
 
-                # Apply row-level confidence coloring for empty/missing cells
-                if row_confidence == "low":
-                    for col_idx in range(1, len(template.headers.get(lookup_sheet_name, [])) + 1):
-                        cell = ws.cell(row=row_idx, column=col_idx)
-                        if cell.value is None:
-                            cell.fill = FILL_LOW_CONFIDENCE
+                if fr == lr and fc == lc:
+                    ws.write(fr - 1, fc - 1, val, fmt)
+                else:
+                    ws.merge_range(fr - 1, fc - 1, lr - 1, lc - 1, val, fmt)
 
-        wb.save(output_path)
+            # ── Step C: Write non-merged cells ──
+            for r in range(1, max_r + 1):
+                for c in range(1, max_c + 1):
+                    if (r, c) in merged_set:
+                        continue  # Already handled by merge_range above
+
+                    # AI data takes priority over existing template data
+                    if (r, c) in ai_cells:
+                        val, conf = ai_cells[(r, c)]
+                        if conf == "low":
+                            fmt = low_conf_fmt
+                        elif conf == "medium":
+                            fmt = med_conf_fmt
+                        else:
+                            fmt = cell_fmt
+                        ws.write(r - 1, c - 1, val, fmt)
+                        cells_written_total += 1
+                    elif (r, c) in existing:
+                        val = existing[(r, c)]
+                        if r == h_row and sheet_type == "table":
+                            fmt = header_fmt
+                        elif sheet_type == "form" and c == 1:
+                            fmt = label_fmt
+                        else:
+                            fmt = cell_fmt
+                        ws.write(r - 1, c - 1, val, fmt)
+
+            print(f"  Sheet '{sheet_name}': wrote {cells_written_total} AI cells")
+
+        wb.close()
+        log_memory("after xlsxwriter close")
         return output_path
+
+    @staticmethod
+    def _resolve_col(col_name: str, header_map: dict[str, int]) -> int | None:
+        """Resolve a column name to a 1-based column index using multiple strategies."""
+        # Strategy 1: Exact match
+        idx = header_map.get(col_name)
+        if idx is not None:
+            return idx
+
+        # Strategy 2: Case-insensitive
+        idx = header_map.get(col_name.lower().strip())
+        if idx is not None:
+            return idx
+
+        # Strategy 3: Partial / substring match
+        col_clean = col_name.lower().strip()
+        for hk, hi in header_map.items():
+            if isinstance(hk, str):
+                hk_clean = hk.lower().strip()
+                if col_clean in hk_clean or hk_clean in col_clean:
+                    return hi
+
+        # Strategy 4: Word overlap (≥2 common words)
+        col_words = set(col_name.lower().split())
+        best_score, best_idx = 0, None
+        for hk, hi in header_map.items():
+            if isinstance(hk, str):
+                common = col_words & set(hk.lower().split())
+                if len(common) > best_score and len(common) >= 2:
+                    best_score = len(common)
+                    best_idx = hi
+        return best_idx
 
 
 class SOC1Agent:
@@ -722,16 +894,13 @@ class SOC1Agent:
         prompt_parts = []
         prompt_parts.append("You are extracting data from a SOC1 Type II audit report to fill an Excel management review template.")
         prompt_parts.append("\n\n## PDF REPORT CONTENT:\n")
-        # MEMORY FIX: Reduced from 80000 to 40000 chars to save memory
-        prompt_parts.append(pdf_content.full_text[:40000])
+        prompt_parts.append(pdf_content.full_text[:80000])
         
-        # Add extracted tables specifically (MEMORY FIX: reduced from 15 to 10 tables)
         if pdf_content.tables:
             prompt_parts.append("\n\n## EXTRACTED TABLES FROM PDF:\n")
-            for i, table in enumerate(pdf_content.tables[:10], 1):
+            for i, table in enumerate(pdf_content.tables[:15], 1):
                 prompt_parts.append(f"\nTable {i}:")
-                # MEMORY FIX: Only show first 5 rows instead of 10
-                for row in table[:5]:
+                for row in table[:10]:
                     prompt_parts.append(f"  {row}")
         
         prompt_parts.append("\n\n## EXCEL SHEETS TO FILL:\n")
@@ -825,8 +994,7 @@ class SOC1Agent:
             print(f"Template sheets: {template.sheet_names}")
             print(f"Sheet types: {template.sheet_type}")
             
-            # MEMORY FIX: Reduced from 65536 to 32768 tokens to save memory
-            response_text = self._generate(prompt, max_tokens=32768, expect_json=True)
+            response_text = self._generate(prompt, max_tokens=65536, expect_json=True)
             
             print(f"\nAI Response length: {len(response_text)} chars")
             print(f"Response preview: {response_text[:500]}...")
@@ -913,11 +1081,10 @@ Return ONLY valid JSON array. No markdown, no commentary."""
                 form_fields = template.form_fields.get(sheet_name, [])
                 fields_text = "\n".join(f"  Row {f['row']}: {f['label'][:60]}" for f in form_fields[:25])
                 
-                # MEMORY FIX: Reduced from 50000 to 30000 chars
                 prompt = f"""Extract answers for this SOC1 Management Review questionnaire.
 
 PDF Content:
-{pdf_content.full_text[:30000]}
+{pdf_content.full_text[:50000]}
 
 Questions to answer (row number: question):
 {fields_text}
@@ -937,7 +1104,7 @@ Return ONLY valid JSON array. No markdown."""
 Columns: {', '.join(headers[:10])}
 
 PDF Content:
-{pdf_content.full_text[:40000]}
+{pdf_content.full_text[:80000]}
 
 Return JSON array:
 [{{"_row": {header_row + 1}, "{headers[0]}": "value"}}]
@@ -945,7 +1112,7 @@ Return JSON array:
 Return ONLY JSON."""
 
             try:
-                response = self._generate(prompt, max_tokens=32768, expect_json=True)
+                response = self._generate(prompt, max_tokens=65536, expect_json=True)
                 print(f"  Response length: {len(response)} chars")
                 print(f"  Response preview: {response[:300]}...")
                 
@@ -1060,10 +1227,13 @@ async def process_soc1_documents(
     print(f"  - Found {len(pdf_content.tables)} tables")
     log_memory("after PDF extraction")
 
-    # Step 2: Read Excel template
+    # Step 2: Read Excel template (read_only + ZIP parse, constant memory)
     print(f"Reading Excel template: {management_review_path}")
-    workbook, template = ExcelHandler.read_template(management_review_path)
-    print(f"  - Found sheets: {template.sheet_names}")
+    _, template = ExcelHandler.read_template(
+        management_review_path,
+        target_tabs=["1.0", "2.0.b"],
+    )
+    print(f"  - Kept sheets: {template.sheet_names}")
     for sheet, headers in template.headers.items():
         print(f"  - {sheet}: {len(headers)} columns")
     log_memory("after Excel template load")
@@ -1076,21 +1246,17 @@ async def process_soc1_documents(
     mappings = agent.extract_and_map(pdf_content, template)
     log_memory("after AI extraction")
 
-    # Step 4: Fill the template
+    # Step 4: Fill the template via xlsxwriter (streaming, constant memory)
     output_filename = f"filled_{management_review_path.name}"
     output_path = output_dir / output_filename
 
     print("Filling Excel template...")
-    ExcelHandler.fill_template(workbook, template, mappings, output_path)
+    ExcelHandler.fill_template(template, mappings, output_path)
     print(f"  - Saved to: {output_path}")
-    log_memory("after workbook save")
+    log_memory("after xlsxwriter save")
 
-    # workbook is None when using read_only + from-scratch fill (OOM fix)
-    if workbook is not None:
-        workbook.close()
-        del workbook
     gc.collect()
-    log_memory("after workbook freed")
+    log_memory("after gc")
 
     # Step 5: Analyze for gaps (only needs a subset of PDF text)
     # Trim pdf_content to reduce memory before gap analysis
