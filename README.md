@@ -82,9 +82,26 @@ Open `http://localhost:5173` to use the UI.
                               ▼                        ▼
                        ┌─────────────────┐     ┌─────────────────┐
                        │   pdfplumber    │     │   openpyxl      │
-                       │   (PDF Extract) │     │   (Excel Write) │
+                       │   (PDF Extract) │     │   (read-only)   │
                        └─────────────────┘     └─────────────────┘
+                                                       │
+                                               ┌───────┴───────┐
+                                               │   xlsxwriter  │
+                                               │  (Excel Write) │
+                                               └───────────────┘
 ```
+
+### Memory-Optimized Excel Pipeline
+
+The Excel read/write pipeline is split into two libraries to stay well under a 2 GB container limit:
+
+| Phase | Library | Mode | Memory |
+|-------|---------|------|--------|
+| **Read template** | openpyxl | `read_only=True` (streaming) | ~20 MB |
+| **Parse layout** | stdlib `zipfile` + `ElementTree.iterparse` | Streaming XML | ~5 MB |
+| **Write output** | xlsxwriter | Forward-only rows | ~10 MB |
+
+Only the target tabs (`1.0` and `2.0.b`) are read from the template. Column widths and merged cells are parsed directly from the XLSX ZIP with streaming XML, so the full workbook object model is never loaded into memory.
 
 ## Dependencies
 
@@ -92,8 +109,9 @@ Open `http://localhost:5173` to use the UI.
 - `fastapi` - Web framework
 - `uvicorn` - ASGI server
 - `pdfplumber` - PDF text and table extraction
-- `openpyxl` - Excel file manipulation
-- `google-generativeai` - Google Gemini AI client
+- `openpyxl` - Excel template reading (read-only streaming)
+- `xlsxwriter` - Excel output writing (memory-efficient)
+- `google-genai` - Google Gemini AI client
 - `python-dotenv` - Environment variable management
 
 ### Frontend
@@ -129,6 +147,23 @@ Get your free Google API key at: https://aistudio.google.com/apikey
 5. Deploy! Render will provide a URL like `https://your-app.onrender.com`
 
 **Note**: Render free tier spins down after 15 minutes of inactivity. Upgrade to paid tier for 24/7 availability.
+
+#### Memory Limits
+
+Render's free tier provides 2 GB RAM. The backend is optimized to stay well within this:
+
+```bash
+# Test locally with the same 2 GB constraint
+docker build -t soc1-agent:latest .
+docker run --rm -it \
+  --memory=2g --memory-swap=2g \
+  -p 8000:8000 \
+  -e GOOGLE_API_KEY="your-key" \
+  -e ENABLE_MEM_LOG=1 \
+  soc1-agent:latest
+```
+
+Set `ENABLE_MEM_LOG=1` to log RSS memory every 0.5 s for debugging.
 
 ### Frontend Deployment (Vercel)
 
