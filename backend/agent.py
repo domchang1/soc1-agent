@@ -77,6 +77,10 @@ class ExcelTemplate:
     existing_cells: dict[str, dict[tuple[int, int], Any]] = field(default_factory=dict)
     max_row: dict[str, int] = field(default_factory=dict)
     max_col: dict[str, int] = field(default_factory=dict)
+    # Formatting info (fonts, colors, borders, etc.)
+    row_heights: dict[str, dict[int, float]] = field(default_factory=dict)
+    cell_formats: dict[str, dict[tuple[int, int], dict[str, Any]]] = field(default_factory=dict)
+    style_definitions: dict[str, Any] = field(default_factory=dict)  # Parsed from styles.xml
 
 
 class PDFExtractor:
@@ -112,11 +116,11 @@ class PDFExtractor:
                 page_text = page.extract_text() or ""
                 text_parts.append(page_text)
 
-                # Extract tables from page (MEMORY FIX: limit to 20 tables total)
-                if len(tables) < 20:
+                # Extract tables from page (MEMORY FIX: limit to 10 tables total to save memory)
+                if len(tables) < 10:
                     page_tables = page.extract_tables() or []
                     for table in page_tables:
-                        if len(tables) >= 20:
+                        if len(tables) >= 10:
                             break
                         # Clean up table data
                         cleaned_table = [
@@ -126,7 +130,11 @@ class PDFExtractor:
                         tables.append(cleaned_table)
 
         full_text = "\n\n--- Page Break ---\n\n".join(text_parts)
-        
+
+        # MEMORY FIX: Delete text_parts immediately to avoid duplicate storage
+        del text_parts
+        gc.collect()
+
         # MEMORY FIX: Don't store individual pages, just return empty list
         # This saves significant memory for large PDFs
         return ExtractedPDFContent(
@@ -196,27 +204,160 @@ class ExcelHandler:
     # ── ZIP layout parser (streaming, low memory) ────────────────────
 
     @staticmethod
+    def _parse_styles_from_zip(zf: zipfile.ZipFile) -> dict[str, Any]:
+        """
+        Parse xl/styles.xml to extract fonts, fills, borders, number formats,
+        and cellXfs (cell format definitions).
+        Returns a dict with parsed style information.
+        """
+        styles_data = {
+            "fonts": [],
+            "fills": [],
+            "borders": [],
+            "numFmts": {},
+            "cellXfs": [],
+        }
+
+        try:
+            if "xl/styles.xml" not in zf.namelist():
+                return styles_data
+
+            styles_bytes = zf.read("xl/styles.xml")
+            styles_root = ET.fromstring(styles_bytes)
+            del styles_bytes
+
+            # Parse fonts
+            fonts_el = styles_root.find(f"{_SSML}fonts")
+            if fonts_el is not None:
+                for font_el in fonts_el.findall(f"{_SSML}font"):
+                    font = {}
+                    name_el = font_el.find(f"{_SSML}name")
+                    if name_el is not None:
+                        font["name"] = name_el.get("val", "Calibri")
+                    sz_el = font_el.find(f"{_SSML}sz")
+                    if sz_el is not None:
+                        font["size"] = float(sz_el.get("val", "11"))
+                    font["bold"] = font_el.find(f"{_SSML}b") is not None
+                    font["italic"] = font_el.find(f"{_SSML}i") is not None
+                    color_el = font_el.find(f"{_SSML}color")
+                    if color_el is not None:
+                        rgb = color_el.get("rgb")
+                        if rgb and len(rgb) >= 6:
+                            font["color"] = rgb[-6:]  # Get last 6 chars (RRGGBB)
+                    styles_data["fonts"].append(font)
+
+            # Parse fills
+            fills_el = styles_root.find(f"{_SSML}fills")
+            if fills_el is not None:
+                for fill_el in fills_el.findall(f"{_SSML}fill"):
+                    fill = {}
+                    pat_fill = fill_el.find(f"{_SSML}patternFill")
+                    if pat_fill is not None:
+                        fill["patternType"] = pat_fill.get("patternType")
+                        fg_color = pat_fill.find(f"{_SSML}fgColor")
+                        if fg_color is not None:
+                            rgb = fg_color.get("rgb")
+                            if rgb and len(rgb) >= 6:
+                                fill["fgColor"] = rgb[-6:]
+                    styles_data["fills"].append(fill)
+
+            # Parse borders
+            borders_el = styles_root.find(f"{_SSML}borders")
+            if borders_el is not None:
+                for border_el in borders_el.findall(f"{_SSML}border"):
+                    border = {}
+                    for side in ["left", "right", "top", "bottom"]:
+                        side_el = border_el.find(f"{_SSML}{side}")
+                        if side_el is not None:
+                            style = side_el.get("style")
+                            if style:
+                                border[side] = style
+                    styles_data["borders"].append(border)
+
+            # Parse number formats
+            numFmts_el = styles_root.find(f"{_SSML}numFmts")
+            if numFmts_el is not None:
+                for numFmt_el in numFmts_el.findall(f"{_SSML}numFmt"):
+                    fmt_id = numFmt_el.get("numFmtId")
+                    fmt_code = numFmt_el.get("formatCode")
+                    if fmt_id and fmt_code:
+                        styles_data["numFmts"][int(fmt_id)] = fmt_code
+
+            # Parse cellXfs (cell format definitions)
+            cellXfs_el = styles_root.find(f"{_SSML}cellXfs")
+            if cellXfs_el is not None:
+                for xf_el in cellXfs_el.findall(f"{_SSML}xf"):
+                    xf = {}
+                    font_id = xf_el.get("fontId")
+                    fill_id = xf_el.get("fillId")
+                    border_id = xf_el.get("borderId")
+                    num_fmt_id = xf_el.get("numFmtId")
+
+                    if font_id is not None:
+                        xf["fontId"] = int(font_id)
+                    if fill_id is not None:
+                        xf["fillId"] = int(fill_id)
+                    if border_id is not None:
+                        xf["borderId"] = int(border_id)
+                    if num_fmt_id is not None:
+                        xf["numFmtId"] = int(num_fmt_id)
+
+                    # Parse alignment
+                    align_el = xf_el.find(f"{_SSML}alignment")
+                    if align_el is not None:
+                        alignment = {}
+                        if align_el.get("horizontal"):
+                            alignment["horizontal"] = align_el.get("horizontal")
+                        if align_el.get("vertical"):
+                            alignment["vertical"] = align_el.get("vertical")
+                        if align_el.get("wrapText") == "1":
+                            alignment["wrapText"] = True
+                        if alignment:
+                            xf["alignment"] = alignment
+
+                    styles_data["cellXfs"].append(xf)
+
+            del styles_root
+        except Exception as e:
+            print(f"Warning: Could not parse styles.xml: {e}")
+
+        return styles_data
+
+    @staticmethod
     def _parse_layout_from_zip(
         excel_path: Path,
         target_sheet_names: list[str],
-    ) -> tuple[dict[str, dict[int, float]], dict[str, list[str]]]:
+    ) -> tuple[dict[str, dict[int, float]], dict[str, list[str]], dict[str, dict[int, float]], dict[str, dict[tuple[int, int], dict[str, Any]]], dict[str, Any]]:
         """
-        Parse column widths and merged cells directly from the XLSX ZIP
-        using streaming XML (iterparse).  Never loads the full sheet DOM
-        into memory, so even very large sheets use only a few MB.
+        Parse column widths, merged cells, row heights, and cell formatting
+        directly from the XLSX ZIP using streaming XML (iterparse).
+        Never loads the full sheet DOM into memory.
+
+        Returns:
+            - column_widths: sheet -> {col_idx: width}
+            - merged_ranges: sheet -> [range_refs]
+            - row_heights: sheet -> {row_idx: height}
+            - cell_formats: sheet -> {(row, col): {styleId, ...}}
+            - style_definitions: parsed styles from styles.xml
         """
         column_widths: dict[str, dict[int, float]] = {}
         merged_ranges: dict[str, list[str]] = {}
+        row_heights: dict[str, dict[int, float]] = {}
+        cell_formats: dict[str, dict[tuple[int, int], dict[str, Any]]] = {}
+        style_definitions: dict[str, Any] = {}
 
         try:
             with zipfile.ZipFile(excel_path, "r") as zf:
+                # Parse styles first
+                style_definitions = ExcelHandler._parse_styles_from_zip(zf)
+
                 # Map sheet names ➜ XML file paths inside the ZIP
                 wb_bytes = zf.read("xl/workbook.xml")
                 wb_root = ET.fromstring(wb_bytes)
                 del wb_bytes
                 sheets_el = wb_root.find(f"{_SSML}sheets")
                 if sheets_el is None:
-                    return column_widths, merged_ranges
+                    return column_widths, merged_ranges, row_heights, cell_formats, style_definitions
 
                 sheet_rid: dict[str, str] = {}
                 for s in sheets_el.findall(f"{_SSML}sheet"):
@@ -245,6 +386,11 @@ class ExcelHandler:
 
                     widths: dict[int, float] = {}
                     merges: list[str] = []
+                    heights: dict[int, float] = {}
+                    formats: dict[tuple[int, int], dict[str, Any]] = {}
+
+                    # MEMORY FIX: Only capture styles for first 550 rows (data limit is 500)
+                    MAX_STYLE_ROWS = 550
 
                     with zf.open(xml_path) as f:
                         for event, elem in ET.iterparse(f, events=("end",)):
@@ -261,16 +407,37 @@ class ExcelHandler:
                                 if ref:
                                     merges.append(ref)
                                 elem.clear()
-                            elif tag in (f"{_SSML}row", f"{_SSML}sheetData",
-                                         f"{_SSML}cols", f"{_SSML}mergeCells"):
+                            elif tag == f"{_SSML}row":
+                                row_num = elem.get("r")
+                                if row_num:
+                                    row_idx = int(row_num)
+                                    # MEMORY FIX: Only capture row heights in our data range
+                                    if row_idx <= MAX_STYLE_ROWS:
+                                        ht = elem.get("ht")
+                                        if ht:
+                                            heights[row_idx] = float(ht)
+                                elem.clear()
+                            elif tag == f"{_SSML}c":
+                                # Cell element - extract style reference
+                                # MEMORY FIX: Only capture style for cells in our data range
+                                cell_ref = elem.get("r")
+                                style_id = elem.get("s")
+                                if cell_ref and style_id:
+                                    row_idx, col_idx = ExcelHandler._ref_to_rowcol(cell_ref)
+                                    if row_idx <= MAX_STYLE_ROWS:
+                                        formats[(row_idx, col_idx)] = {"styleId": int(style_id)}
+                                elem.clear()
+                            elif tag in (f"{_SSML}sheetData", f"{_SSML}cols", f"{_SSML}mergeCells"):
                                 elem.clear()
 
                     column_widths[sheet_name] = widths
                     merged_ranges[sheet_name] = merges
+                    row_heights[sheet_name] = heights
+                    cell_formats[sheet_name] = formats
         except Exception as e:
             print(f"Warning: Could not parse XLSX layout from ZIP: {e}")
 
-        return column_widths, merged_ranges
+        return column_widths, merged_ranges, row_heights, cell_formats, style_definitions
 
     # ── read_template ────────────────────────────────────────────────
 
@@ -377,6 +544,7 @@ class ExcelHandler:
                 is_form = form_like_rows > table_like_rows * 2
                 sheet_types[sheet_name] = "form" if is_form else "table"
 
+                # MEMORY FIX: Process form fields while we still have rows_by_idx
                 if is_form:
                     for row_idx in range(1, min(500, len(rows_by_idx) + 1)):
                         row = rows_by_idx.get(row_idx, [])
@@ -417,13 +585,17 @@ class ExcelHandler:
                 headers[sheet_name] = sheet_headers
                 header_to_col[sheet_name] = sheet_header_to_col
                 structure[sheet_name] = []
+
+                # MEMORY FIX: Delete rows_by_idx to free memory immediately
+                del rows_by_idx
+                gc.collect()
         finally:
             wb.close()
         del wb
         gc.collect()
 
-        # ── Phase 2: Parse layout from ZIP (column widths, merges) ──
-        col_widths, merge_ranges = ExcelHandler._parse_layout_from_zip(
+        # ── Phase 2: Parse layout from ZIP (column widths, merges, formatting) ──
+        col_widths, merge_ranges, row_hts, cell_fmts, style_defs = ExcelHandler._parse_layout_from_zip(
             excel_path, sheet_names,
         )
         log_memory("after ZIP layout parse")
@@ -442,9 +614,102 @@ class ExcelHandler:
             existing_cells=all_existing_cells,
             max_row=max_rows,
             max_col=max_cols,
+            row_heights=row_hts,
+            cell_formats=cell_fmts,
+            style_definitions=style_defs,
         )
 
     # ── fill_template (xlsxwriter) ───────────────────────────────────
+
+    @staticmethod
+    def _create_format_from_style(
+        wb: Any,  # xlsxwriter.Workbook
+        style_id: int,
+        style_defs: dict[str, Any],
+        confidence_override: str | None = None,
+    ) -> Any:  # xlsxwriter.Format
+        """
+        Create an xlsxwriter format object from parsed style definitions.
+        If confidence_override is provided ("low" or "medium"), override the background color.
+        """
+        fmt_props = {}
+
+        cellXfs = style_defs.get("cellXfs", [])
+        if style_id < len(cellXfs):
+            xf = cellXfs[style_id]
+
+            # Font
+            font_id = xf.get("fontId")
+            if font_id is not None and font_id < len(style_defs.get("fonts", [])):
+                font = style_defs["fonts"][font_id]
+                if "name" in font:
+                    fmt_props["font_name"] = font["name"]
+                if "size" in font:
+                    fmt_props["font_size"] = font["size"]
+                if font.get("bold"):
+                    fmt_props["bold"] = True
+                if font.get("italic"):
+                    fmt_props["italic"] = True
+                if "color" in font:
+                    fmt_props["font_color"] = f"#{font['color']}"
+
+            # Fill (background color) - override if confidence specified
+            if confidence_override == "low":
+                fmt_props["bg_color"] = "#FFCCCC"
+            elif confidence_override == "medium":
+                fmt_props["bg_color"] = "#FFFFCC"
+            else:
+                fill_id = xf.get("fillId")
+                if fill_id is not None and fill_id < len(style_defs.get("fills", [])):
+                    fill = style_defs["fills"][fill_id]
+                    if fill.get("fgColor") and fill.get("patternType") in ("solid", "darkGray", "lightGray"):
+                        fmt_props["bg_color"] = f"#{fill['fgColor']}"
+
+            # Borders
+            border_id = xf.get("borderId")
+            if border_id is not None and border_id < len(style_defs.get("borders", [])):
+                border = style_defs["borders"][border_id]
+                border_map = {
+                    "thin": 1, "medium": 2, "thick": 5, "double": 6,
+                    "hair": 7, "dotted": 4, "dashed": 3, "dashDot": 9,
+                    "dashDotDot": 10, "slantDashDot": 11,
+                }
+                for side in ["left", "right", "top", "bottom"]:
+                    if side in border:
+                        fmt_props[f"{side}"] = border_map.get(border[side], 1)
+
+            # Alignment
+            alignment = xf.get("alignment", {})
+            h_align_map = {
+                "left": "left", "center": "center", "right": "right",
+                "fill": "fill", "justify": "justify", "distributed": "distributed",
+            }
+            v_align_map = {
+                "top": "top", "center": "vcenter", "bottom": "bottom",
+                "justify": "vjustify", "distributed": "vdistributed",
+            }
+            if "horizontal" in alignment:
+                fmt_props["align"] = h_align_map.get(alignment["horizontal"], "left")
+            if "vertical" in alignment:
+                fmt_props["valign"] = v_align_map.get(alignment["vertical"], "top")
+            if alignment.get("wrapText"):
+                fmt_props["text_wrap"] = True
+
+            # Number format
+            num_fmt_id = xf.get("numFmtId")
+            if num_fmt_id is not None:
+                # Check custom formats
+                if num_fmt_id in style_defs.get("numFmts", {}):
+                    fmt_props["num_format"] = style_defs["numFmts"][num_fmt_id]
+                # Built-in formats (common ones)
+                elif num_fmt_id == 1:
+                    fmt_props["num_format"] = "0"
+                elif num_fmt_id == 2:
+                    fmt_props["num_format"] = "0.00"
+                elif num_fmt_id == 14:
+                    fmt_props["num_format"] = "mm/dd/yyyy"
+
+        return wb.add_format(fmt_props)
 
     @staticmethod
     def fill_template(
@@ -454,8 +719,8 @@ class ExcelHandler:
     ) -> Path:
         """
         Write a new Excel file with xlsxwriter, reproducing the template
-        layout (column widths, merged cells, existing labels/headers) and
-        overlaying the AI-extracted data with confidence-based coloring.
+        layout (column widths, merged cells, row heights, fonts, colors, borders)
+        and overlaying the AI-extracted data with confidence-based coloring.
 
         xlsxwriter writes forward-only, row-by-row, so memory usage stays
         constant regardless of sheet size.
@@ -470,26 +735,28 @@ class ExcelHandler:
         print(f"Sheet types: {template.sheet_type}")
 
         wb = xlsxwriter.Workbook(str(output_path))
+        style_defs = template.style_definitions
 
-        # ── Define reusable formats ──
-        header_fmt = wb.add_format({
-            "bold": True, "text_wrap": True, "valign": "top",
-            "border": 1, "bg_color": "#D9E1F2",
-        })
-        cell_fmt = wb.add_format({
-            "text_wrap": True, "valign": "top", "border": 1,
-        })
-        label_fmt = wb.add_format({
-            "bold": True, "text_wrap": True, "valign": "top",
-        })
-        low_conf_fmt = wb.add_format({
-            "text_wrap": True, "valign": "top", "border": 1,
-            "bg_color": "#FFCCCC",
-        })
-        med_conf_fmt = wb.add_format({
-            "text_wrap": True, "valign": "top", "border": 1,
-            "bg_color": "#FFFFCC",
-        })
+        # Cache format objects by (styleId, confidence_override)
+        format_cache: dict[tuple[int | None, str | None], Any] = {}
+
+        def get_format(style_id: int | None, confidence: str | None = None) -> Any:
+            """Get or create a format object for the given style and confidence."""
+            cache_key = (style_id, confidence)
+            if cache_key not in format_cache:
+                if style_id is not None:
+                    format_cache[cache_key] = ExcelHandler._create_format_from_style(
+                        wb, style_id, style_defs, confidence
+                    )
+                else:
+                    # Default format
+                    props = {}
+                    if confidence == "low":
+                        props["bg_color"] = "#FFCCCC"
+                    elif confidence == "medium":
+                        props["bg_color"] = "#FFFFCC"
+                    format_cache[cache_key] = wb.add_format(props)
+            return format_cache[cache_key]
 
         def normalize_confidence(c: Any) -> str:
             if c in ("h", "high"):
@@ -508,10 +775,15 @@ class ExcelHandler:
             existing = template.existing_cells.get(sheet_name, {})
             max_r = template.max_row.get(sheet_name, 0)
             max_c = template.max_col.get(sheet_name, 0)
+            cell_fmts = template.cell_formats.get(sheet_name, {})
 
             # ── Set column widths ──
             for col_1, width in template.column_widths.get(sheet_name, {}).items():
                 ws.set_column(col_1 - 1, col_1 - 1, width)
+
+            # ── Set row heights ──
+            for row_1, height in template.row_heights.get(sheet_name, {}).items():
+                ws.set_row(row_1 - 1, height)
 
             # ── Step A: Build AI cell overlay FIRST ──
             # (must happen before merge writing so AI values can override)
@@ -589,18 +861,19 @@ class ExcelHandler:
                     if ai_val is not None:
                         break
 
+                # Get original cell style from template
+                orig_style_id = cell_fmts.get((fr, fc), {}).get("styleId")
+
                 if ai_val is not None:
                     val = ai_val
-                    if ai_conf == "low":
-                        fmt = low_conf_fmt
-                    elif ai_conf == "medium":
-                        fmt = med_conf_fmt
-                    else:
-                        fmt = cell_fmt
+                    # AI data: apply confidence coloring (overrides original bg)
+                    conf_override = ai_conf if ai_conf != "high" else None
+                    fmt = get_format(orig_style_id, conf_override)
                     cells_written_total += 1
                 else:
+                    # No AI data: use original template value and style
                     val = existing.get((fr, fc), "")
-                    fmt = header_fmt if fr == h_row else cell_fmt
+                    fmt = get_format(orig_style_id)
 
                 if fr == lr and fc == lc:
                     ws.write(fr - 1, fc - 1, val, fmt)
@@ -613,28 +886,27 @@ class ExcelHandler:
                     if (r, c) in merged_set:
                         continue  # Already handled by merge_range above
 
+                    # Get original cell style from template
+                    orig_style_id = cell_fmts.get((r, c), {}).get("styleId")
+
                     # AI data takes priority over existing template data
                     if (r, c) in ai_cells:
                         val, conf = ai_cells[(r, c)]
-                        if conf == "low":
-                            fmt = low_conf_fmt
-                        elif conf == "medium":
-                            fmt = med_conf_fmt
-                        else:
-                            fmt = cell_fmt
+                        # AI data: apply confidence coloring (overrides original bg)
+                        conf_override = conf if conf != "high" else None
+                        fmt = get_format(orig_style_id, conf_override)
                         ws.write(r - 1, c - 1, val, fmt)
                         cells_written_total += 1
                     elif (r, c) in existing:
+                        # No AI data: use original template value and style
                         val = existing[(r, c)]
-                        if r == h_row and sheet_type == "table":
-                            fmt = header_fmt
-                        elif sheet_type == "form" and c == 1:
-                            fmt = label_fmt
-                        else:
-                            fmt = cell_fmt
+                        fmt = get_format(orig_style_id)
                         ws.write(r - 1, c - 1, val, fmt)
 
             print(f"  Sheet '{sheet_name}': wrote {cells_written_total} AI cells")
+
+            # MEMORY FIX: Aggressive GC after each sheet
+            gc.collect()
 
         wb.close()
         log_memory("after xlsxwriter close")

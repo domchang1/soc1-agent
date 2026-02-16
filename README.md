@@ -98,10 +98,19 @@ The Excel read/write pipeline is split into two libraries to stay well under a 2
 | Phase | Library | Mode | Memory |
 |-------|---------|------|--------|
 | **Read template** | openpyxl | `read_only=True` (streaming) | ~20 MB |
-| **Parse layout** | stdlib `zipfile` + `ElementTree.iterparse` | Streaming XML | ~5 MB |
+| **Parse layout & styles** | stdlib `zipfile` + `ElementTree.iterparse` | Streaming XML | ~5 MB |
 | **Write output** | xlsxwriter | Forward-only rows | ~10 MB |
 
-Only the target tabs (`1.0` and `2.0.b`) are read from the template. Column widths and merged cells are parsed directly from the XLSX ZIP with streaming XML, so the full workbook object model is never loaded into memory.
+Only the target tabs (`1.0` and `2.0.b`) are kept in the output to minimize memory usage. All original formatting is preserved through streaming XML parsing:
+- **Fonts** (family, size, bold, italic, color)
+- **Cell backgrounds** (colors and patterns)
+- **Borders** (all sides with correct styles)
+- **Number formats** (dates, decimals, etc.)
+- **Alignment** (horizontal, vertical, text wrapping)
+- **Column widths** and **row heights**
+- **Merged cells**
+
+The styles are parsed directly from `xl/styles.xml` in the XLSX ZIP, so the full workbook object model is never loaded into memory. AI-extracted data with low/medium confidence gets highlighted background colors (red/yellow) that override the original template colors.
 
 ## Dependencies
 
@@ -150,10 +159,19 @@ Get your free Google API key at: https://aistudio.google.com/apikey
 
 #### Memory Limits
 
-Render's free tier provides 2 GB RAM. The backend is optimized to stay well within this:
+Render's free tier provides 2 GB RAM. The backend is heavily optimized to stay well within this limit through multiple memory-saving techniques:
 
+**Memory Optimizations:**
+- PDF extraction limited to 50 pages max
+- Table extraction limited to 10 tables
+- Excel cell formats captured only for first 550 rows
+- Immediate cleanup of temporary data structures (text_parts, rows_by_idx)
+- Aggressive garbage collection after each processing phase
+- Streaming XML parsing for all Excel formatting data
+- Row-by-row Excel writing (never loads full workbook)
+
+**Test locally with 2 GB constraint:**
 ```bash
-# Test locally with the same 2 GB constraint
 docker build -t soc1-agent:latest .
 docker run --rm -it \
   --memory=2g --memory-swap=2g \
@@ -164,6 +182,15 @@ docker run --rm -it \
 ```
 
 Set `ENABLE_MEM_LOG=1` to log RSS memory every 0.5 s for debugging.
+
+**Expected Memory Usage:**
+- Start: ~50 MB (Python + libraries)
+- After PDF extraction: ~150-200 MB
+- After Excel template load: ~200-300 MB
+- Peak during fill_template: ~350-450 MB
+- Final after cleanup: ~150-250 MB
+
+See `MEMORY_ANALYSIS.md` for detailed breakdown.
 
 ### Frontend Deployment (Vercel)
 
