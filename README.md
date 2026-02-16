@@ -162,13 +162,23 @@ Get your free Google API key at: https://aistudio.google.com/apikey
 Render's free tier provides 2 GB RAM. The backend is heavily optimized to stay well within this limit through multiple memory-saving techniques:
 
 **Memory Optimizations:**
-- PDF extraction limited to 50 pages max
-- Table extraction limited to 10 tables
-- Excel cell formats captured only for first 550 rows
+- PDF extraction: 150 pages max (covers most SOC1 reports)
+- Table extraction: 40 tables max (comprehensive coverage)
+- Excel templates: Up to 1000 rows × 75 columns
+- Excel cell formats captured only for first 1100 rows
 - Immediate cleanup of temporary data structures (text_parts, rows_by_idx)
 - Aggressive garbage collection after each processing phase
 - Streaming XML parsing for all Excel formatting data
 - Row-by-row Excel writing (never loads full workbook)
+
+**AI Quality Improvements:**
+- Temperature: 0.3 (balanced reasoning, was 0.1 conservative)
+- Context window: 200K chars (2.5x more PDF context)
+- Output tokens: 100K max (handles largest templates)
+- Shows ALL table rows, form fields, and headers in prompts
+- Enhanced prompts with extraction strategies and tips
+- 5 retries with smart backoff (was 3)
+- CUEC extraction: 60K char context (3x improvement)
 
 **Test locally with 2 GB constraint:**
 ```bash
@@ -183,14 +193,17 @@ docker run --rm -it \
 
 Set `ENABLE_MEM_LOG=1` to log RSS memory every 0.5 s for debugging.
 
-**Expected Memory Usage:**
+**Expected Memory Usage (Phase 1 Optimizations):**
 - Start: ~50 MB (Python + libraries)
-- After PDF extraction: ~150-200 MB
-- After Excel template load: ~200-300 MB
-- Peak during fill_template: ~350-450 MB
-- Final after cleanup: ~150-250 MB
+- After PDF extraction: ~200-300 MB (3x more pages/tables)
+- After Excel template load: ~300-400 MB (2x more rows/cols)
+- Peak during AI extraction: ~600-800 MB (larger prompts/responses)
+- Peak during fill_template: ~500-700 MB
+- Final after cleanup: ~200-300 MB
 
-See `MEMORY_ANALYSIS.md` for detailed breakdown.
+**Memory Budget:** ~800 MB peak (well under 2 GB limit with 1.2 GB buffer)
+
+See `MEMORY_ANALYSIS.md` and `PERFORMANCE_IMPROVEMENTS.md` for detailed analysis.
 
 ### Frontend Deployment (Vercel)
 
