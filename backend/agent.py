@@ -390,9 +390,9 @@ class ExcelHandler:
                     heights: dict[int, float] = {}
                     formats: dict[tuple[int, int], dict[str, Any]] = {}
 
-                    # MEMORY FIX: Only capture styles for first 1100 rows (data limit is 1000)
-                    # PERFORMANCE: Increased to support larger templates
-                    MAX_STYLE_ROWS = 1100
+                    # MEMORY OPTIMIZATION: Only capture styles for first 60 rows
+                    # Actual data is ~36 rows, using 60 for safety buffer
+                    MAX_STYLE_ROWS = 60
 
                     with zf.open(xml_path) as f:
                         for event, elem in ET.iterparse(f, events=("end",)):
@@ -401,8 +401,8 @@ class ExcelHandler:
                                 min_c = int(elem.get("min", "1"))
                                 max_c = int(elem.get("max", str(min_c)))
                                 w = float(elem.get("width", "8.43"))
-                                # PERFORMANCE: Increased from 51 to 76 to match 75 col limit
-                                for c in range(min_c, min(max_c + 1, 76)):
+                                # MEMORY OPTIMIZATION: Limit to 11 cols (actual data is ~7 cols)
+                                for c in range(min_c, min(max_c + 1, 11)):
                                     widths[c] = w
                                 elem.clear()
                             elif tag == f"{_SSML}mergeCell":
@@ -503,11 +503,11 @@ class ExcelHandler:
                 max_r = 0
                 max_c = 0
 
-                # Single pass: capture all cells (up to 1000 rows, 75 cols)
-                # PERFORMANCE: Increased from 500x50 to handle larger templates
+                # Single pass: capture all cells (up to 50 rows, 10 cols)
+                # OPTIMIZED: Actual data is ~36 rows × 7 cols, using 50×10 for safety buffer
                 rows_by_idx: dict[int, list[Any]] = {}
                 for row_idx, row in enumerate(
-                    ws.iter_rows(min_row=1, max_row=1000, max_col=75,
+                    ws.iter_rows(min_row=1, max_row=50, max_col=10,
                                  values_only=True), 1
                 ):
                     row_list = list(row) if row else []
@@ -550,8 +550,8 @@ class ExcelHandler:
 
                 # MEMORY FIX: Process form fields while we still have rows_by_idx
                 if is_form:
-                    # PERFORMANCE: Check up to 1000 rows (was 500)
-                    for row_idx in range(1, min(1000, len(rows_by_idx) + 1)):
+                    # OPTIMIZED: Check up to 50 rows (actual data ~36 rows)
+                    for row_idx in range(1, min(50, len(rows_by_idx) + 1)):
                         row = rows_by_idx.get(row_idx, [])
                         label = row[0] if len(row) > 0 else None
                         if label and isinstance(label, str) and len(label.strip()) > 0:
