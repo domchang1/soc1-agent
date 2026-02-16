@@ -108,19 +108,20 @@ class PDFExtractor:
                 "metadata": pdf.metadata or {},
             }
 
-            # MEMORY FIX: Limit to first 50 pages to prevent memory issues
-            max_pages = min(50, len(pdf.pages))
-            
+            # PERFORMANCE: Expanded to 150 pages for better coverage (was 50)
+            # Most SOC1 reports are 100-200 pages - we want full context
+            max_pages = min(150, len(pdf.pages))
+
             for i, page in enumerate(pdf.pages[:max_pages]):
                 # Extract text from page
                 page_text = page.extract_text() or ""
                 text_parts.append(page_text)
 
-                # Extract tables from page (MEMORY FIX: limit to 10 tables total to save memory)
-                if len(tables) < 10:
+                # PERFORMANCE: Expanded to 40 tables (was 10) for comprehensive extraction
+                if len(tables) < 40:
                     page_tables = page.extract_tables() or []
                     for table in page_tables:
-                        if len(tables) >= 10:
+                        if len(tables) >= 40:
                             break
                         # Clean up table data
                         cleaned_table = [
@@ -389,8 +390,9 @@ class ExcelHandler:
                     heights: dict[int, float] = {}
                     formats: dict[tuple[int, int], dict[str, Any]] = {}
 
-                    # MEMORY FIX: Only capture styles for first 550 rows (data limit is 500)
-                    MAX_STYLE_ROWS = 550
+                    # MEMORY FIX: Only capture styles for first 1100 rows (data limit is 1000)
+                    # PERFORMANCE: Increased to support larger templates
+                    MAX_STYLE_ROWS = 1100
 
                     with zf.open(xml_path) as f:
                         for event, elem in ET.iterparse(f, events=("end",)):
@@ -399,7 +401,8 @@ class ExcelHandler:
                                 min_c = int(elem.get("min", "1"))
                                 max_c = int(elem.get("max", str(min_c)))
                                 w = float(elem.get("width", "8.43"))
-                                for c in range(min_c, min(max_c + 1, 51)):
+                                # PERFORMANCE: Increased from 51 to 76 to match 75 col limit
+                                for c in range(min_c, min(max_c + 1, 76)):
                                     widths[c] = w
                                 elem.clear()
                             elif tag == f"{_SSML}mergeCell":
@@ -500,10 +503,11 @@ class ExcelHandler:
                 max_r = 0
                 max_c = 0
 
-                # Single pass: capture all cells (up to 500 rows, 50 cols)
+                # Single pass: capture all cells (up to 1000 rows, 75 cols)
+                # PERFORMANCE: Increased from 500x50 to handle larger templates
                 rows_by_idx: dict[int, list[Any]] = {}
                 for row_idx, row in enumerate(
-                    ws.iter_rows(min_row=1, max_row=500, max_col=50,
+                    ws.iter_rows(min_row=1, max_row=1000, max_col=75,
                                  values_only=True), 1
                 ):
                     row_list = list(row) if row else []
@@ -546,7 +550,8 @@ class ExcelHandler:
 
                 # MEMORY FIX: Process form fields while we still have rows_by_idx
                 if is_form:
-                    for row_idx in range(1, min(500, len(rows_by_idx) + 1)):
+                    # PERFORMANCE: Check up to 1000 rows (was 500)
+                    for row_idx in range(1, min(1000, len(rows_by_idx) + 1)):
                         row = rows_by_idx.get(row_idx, [])
                         label = row[0] if len(row) > 0 else None
                         if label and isinstance(label, str) and len(label.strip()) > 0:
@@ -975,18 +980,23 @@ class SOC1Agent:
     def _generate(self,
         prompt: str,
         max_tokens: int = 8192,
-        retries: int = 3,
+        retries: int = 5,  # PERFORMANCE: Increased from 3 to 5 for better reliability
+        temperature: float | None = None,  # PERFORMANCE: Allow caller to specify temperature
         expect_json: bool = False) -> str:
         """Generate a response from Gemini with retry logic."""
         import time
-        
+
         last_error = None
         for attempt in range(retries):
             try:
+                # PERFORMANCE: Higher temperature (0.3) for better reasoning
+                # Lower temp (0.1) was too conservative, missed valid inferences
+                if temperature is None:
+                    temperature = 0.3 if max_tokens > 10000 else 0.2
 
                 config_kwargs = dict(
                     max_output_tokens=max_tokens,
-                    temperature=0.1,
+                    temperature=temperature,
                 )
                 if expect_json:
                     config_kwargs["response_mime_type"] = "application/json"
@@ -1164,15 +1174,24 @@ class SOC1Agent:
                 deviations_sheet = sheet_name
 
         prompt_parts = []
-        prompt_parts.append("You are extracting data from a SOC1 Type II audit report to fill an Excel management review template.")
+        prompt_parts.append("You are an expert at extracting data from SOC1 Type II audit reports to fill Excel management review templates.")
+        prompt_parts.append("\n\n## EXTRACTION STRATEGY:")
+        prompt_parts.append("1. Read the entire document to understand structure and sections")
+        prompt_parts.append("2. For each data point, cross-reference across pages if needed")
+        prompt_parts.append("3. Synthesize information that spans multiple sections")
+        prompt_parts.append("4. Use 'medium' confidence when combining data from different pages")
+        prompt_parts.append("5. Use 'low' confidence when inferring from context")
+
         prompt_parts.append("\n\n## PDF REPORT CONTENT:\n")
-        prompt_parts.append(pdf_content.full_text[:80000])
-        
+        # PERFORMANCE: Expanded from 80K to 200K chars for 2.5x more context
+        prompt_parts.append(pdf_content.full_text[:200000])
+
         if pdf_content.tables:
             prompt_parts.append("\n\n## EXTRACTED TABLES FROM PDF:\n")
-            for i, table in enumerate(pdf_content.tables[:15], 1):
+            # PERFORMANCE: Show all tables (was limited to 15), more rows per table (25 vs 10)
+            for i, table in enumerate(pdf_content.tables[:40], 1):
                 prompt_parts.append(f"\nTable {i}:")
-                for row in table[:10]:
+                for row in table[:25]:
                     prompt_parts.append(f"  {row}")
         
         prompt_parts.append("\n\n## EXCEL SHEETS TO FILL:\n")
@@ -1183,8 +1202,9 @@ class SOC1Agent:
             prompt_parts.append(f"\n### Sheet: {management_sheet} (FORM-STYLE)")
             prompt_parts.append("This is a questionnaire. For each question, provide the answer from the PDF.")
             prompt_parts.append("Fields to fill:")
-            for field in form_fields[:30]:  # Show up to 30 fields
-                label = field['label'][:80]
+            # PERFORMANCE: Show ALL fields (was limited to 30)
+            for field in form_fields:
+                label = field['label'][:100]  # Show more of label (was 80 chars)
                 prompt_parts.append(f"  - Row {field['row']}: \"{label}\"")
         
         # Handle CUEC sheet (table-style)
@@ -1193,18 +1213,21 @@ class SOC1Agent:
             prompt_parts.append(f"\n### Sheet: {cuec_sheet} (TABLE)")
             prompt_parts.append(f"Header row: {template.header_row.get(cuec_sheet)}")
             prompt_parts.append("Column headers (USE THESE EXACT NAMES):")
-            for i, h in enumerate(cuec_headers[:10], 1):
+            # PERFORMANCE: Show ALL headers (was limited to 10)
+            for i, h in enumerate(cuec_headers, 1):
                 prompt_parts.append(f"  {i}. \"{h}\"")
             prompt_parts.append("\nLook for 'Complementary User Entity Controls' section in the PDF.")
-            prompt_parts.append("Extract each CUEC with its control objective.")
-        
+            prompt_parts.append("Extract ALL CUECs - they are often in tables or numbered lists near the end of the document.")
+            prompt_parts.append("CUECs may also be called 'User Entity Responsibilities' or 'Subservice Organization Controls'.")
+
         # Handle Deviations sheet
         if deviations_sheet and template.sheet_type.get(deviations_sheet) == "table":
             dev_headers = template.headers.get(deviations_sheet, [])
             prompt_parts.append(f"\n### Sheet: {deviations_sheet} (TABLE)")
             prompt_parts.append(f"Header row: {template.header_row.get(deviations_sheet)}")
             prompt_parts.append("Column headers:")
-            for i, h in enumerate(dev_headers[:10], 1):
+            # PERFORMANCE: Show ALL headers (was limited to 10)
+            for i, h in enumerate(dev_headers, 1):
                 prompt_parts.append(f"  {i}. \"{h}\"")
         
         # JSON format instructions
@@ -1265,8 +1288,10 @@ class SOC1Agent:
             print(f"Prompt length: {len(prompt)} chars")
             print(f"Template sheets: {template.sheet_names}")
             print(f"Sheet types: {template.sheet_type}")
-            
-            response_text = self._generate(prompt, max_tokens=65536, expect_json=True)
+
+            # PERFORMANCE: Increased max_tokens to 100K (was 65K) for larger templates
+            # Using temperature=0.3 (default) for better reasoning
+            response_text = self._generate(prompt, max_tokens=100000, expect_json=True)
             
             print(f"\nAI Response length: {len(response_text)} chars")
             print(f"Response preview: {response_text[:500]}...")
@@ -1311,34 +1336,46 @@ class SOC1Agent:
             
             if "user entity" in sheet_lower or "cuec" in sheet_lower or "comp user" in sheet_lower:
                 # Special handling for CUEC sheet - look specifically for the CUEC section
-                # MEMORY FIX: Only send relevant portion of PDF for CUECs
                 # Look for CUEC section in the text
                 cuec_section = ""
                 full_text_lower = pdf_content.full_text.lower()
                 cuec_start = full_text_lower.find("complementary user entity control")
                 if cuec_start == -1:
                     cuec_start = full_text_lower.find("cuec")
-                
+
                 if cuec_start != -1:
-                    # Extract 20000 chars around the CUEC section
-                    start = max(0, cuec_start - 5000)
-                    end = min(len(pdf_content.full_text), cuec_start + 15000)
+                    # PERFORMANCE: Extract 60K chars around CUEC section (was 20K)
+                    start = max(0, cuec_start - 10000)
+                    end = min(len(pdf_content.full_text), cuec_start + 50000)
                     cuec_section = pdf_content.full_text[start:end]
                 else:
-                    # Fallback: use last 20000 chars (CUECs often at end)
-                    cuec_section = pdf_content.full_text[-20000:]
+                    # PERFORMANCE: Use last 60K chars (was 20K) - CUECs often at end
+                    cuec_section = pdf_content.full_text[-60000:]
                 
-                prompt = f"""Extract Complementary User Entity Controls (CUECs) from this SOC1 Type II report.
+                prompt = f"""Extract ALL Complementary User Entity Controls (CUECs) from this SOC1 Type II report.
 
-Look for the section titled "Complementary User Entity Controls" or "CUECs".
+CUECs describe responsibilities that the user organization must perform. They may be called:
+- "Complementary User Entity Controls"
+- "CUECs"
+- "User Entity Responsibilities"
+- "Complementary Controls"
+- "User Organization Controls"
 
-PDF Content (relevant section):
+Common patterns:
+- Usually in a dedicated section near the end of the report
+- Often in a table or numbered list format
+- Each CUEC has: a number/ID, description, and related control objective
+- There are typically 5-20 CUECs in a report
+
+PDF Content (CUEC section + context):
 {cuec_section}
 
 Excel columns to fill (USE THESE EXACT NAMES):
-{chr(10).join(f'  - "{h}"' for h in headers[:7])}
+{chr(10).join(f'  - "{h}"' for h in headers)}
 
 The header row is {header_row}, so data starts at row {header_row + 1}.
+
+IMPORTANT: Extract ALL CUECs you find. Read carefully through tables and lists.
 
 Return JSON array with one object per CUEC found:
 [
@@ -1351,17 +1388,27 @@ Return ONLY valid JSON array. No markdown, no commentary."""
             elif "management review" in sheet_lower:
                 # Management review form
                 form_fields = template.form_fields.get(sheet_name, [])
-                fields_text = "\n".join(f"  Row {f['row']}: {f['label'][:60]}" for f in form_fields[:25])
-                
+                # PERFORMANCE: Show ALL fields (was limited to 25), more chars per field (100 vs 60)
+                fields_text = "\n".join(f"  Row {f['row']}: {f['label'][:100]}" for f in form_fields)
+
+                # PERFORMANCE: Use more PDF context (100K vs 50K)
                 prompt = f"""Extract answers for this SOC1 Management Review questionnaire.
 
+Tips for finding answers:
+- Service organization name: Usually on cover page or Section 1
+- Report period: Cover page or executive summary
+- Report type: "Type I" or "Type II" on cover page
+- Controls tested: Count from controls section (Section 3-4)
+- Exceptions: Look for "exceptions", "deviations", or "findings" sections
+- Opinion: Look for auditor's opinion section (often Section 2)
+
 PDF Content:
-{pdf_content.full_text[:50000]}
+{pdf_content.full_text[:100000]}
 
 Questions to answer (row number: question):
 {fields_text}
 
-Return JSON array with answers:
+Return JSON array with answers. Leave Answer empty if not found in PDF:
 [
   {{"_row": 4, "Answer": "Okta, Inc."}},
   {{"_row": 5, "Answer": "SOC1 Type II Report"}},
@@ -1371,20 +1418,22 @@ Return JSON array with answers:
 Return ONLY valid JSON array. No markdown."""
             else:
                 # Generic extraction
+                # PERFORMANCE: Show ALL headers (was 10), use more context (150K vs 80K)
                 prompt = f"""Extract data from this SOC1 report for sheet "{sheet_name}".
 
-Columns: {', '.join(headers[:10])}
+Columns: {', '.join(headers)}
 
 PDF Content:
-{pdf_content.full_text[:80000]}
+{pdf_content.full_text[:150000]}
 
-Return JSON array:
+Return JSON array with one object per row:
 [{{"_row": {header_row + 1}, "{headers[0]}": "value"}}]
 
 Return ONLY JSON."""
 
             try:
-                response = self._generate(prompt, max_tokens=65536, expect_json=True)
+                # PERFORMANCE: Use higher max_tokens (100K vs 65K) and better temperature (0.4 for fallback)
+                response = self._generate(prompt, max_tokens=100000, temperature=0.4, expect_json=True)
                 print(f"  Response length: {len(response)} chars")
                 print(f"  Response preview: {response[:300]}...")
                 
@@ -1425,10 +1474,10 @@ Return ONLY JSON."""
         prompt = f"""Analyze the following SOC1 Type II report data extraction for completeness and accuracy.
 
 ## Extracted Data (filled into management review template):
-{json.dumps(filled_data, indent=2, default=str)[:20000]}
+{json.dumps(filled_data, indent=2, default=str)[:50000]}
 
-## Original Report Summary (first 10000 chars):
-{pdf_content.full_text[:10000]}
+## Original Report Summary:
+{pdf_content.full_text[:15000]}
 
 ## Analysis Required:
 1. Identify any controls mentioned in the report that may not have been captured
@@ -1456,7 +1505,8 @@ Return a JSON object:
 
 Return ONLY the JSON object."""
 
-        response_text = self._generate(prompt, max_tokens=4096, expect_json=True)
+        # PERFORMANCE: Conservative temperature (0.2) for analysis, higher max_tokens (8K vs 4K)
+        response_text = self._generate(prompt, max_tokens=8192, temperature=0.2, expect_json=True)
 
         try:
             return self._parse_json_response(response_text)
