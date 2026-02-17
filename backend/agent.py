@@ -1156,15 +1156,27 @@ class SOC1Agent:
         self,
         pdf_content: ExtractedPDFContent,
         template: ExcelTemplate,
+        target_sheets: list[str] | None = None,
     ) -> str:
-        """Create a prompt for the AI to extract and map data."""
-        
+        """Create a prompt for the AI to extract and map data.
+
+        Args:
+            pdf_content: Extracted PDF content
+            template: Excel template structure
+            target_sheets: Optional list of sheet name substrings to filter which sheets to process
+        """
+
         # Find sheets that match management review and CUEC patterns
+        # Filter by target_sheets if provided
         management_sheet = None
         cuec_sheet = None
         deviations_sheet = None
-        
+
         for sheet_name in template.sheet_names:
+            # Skip if target_sheets is specified and this sheet doesn't match
+            if target_sheets and not any(target in sheet_name for target in target_sheets):
+                continue
+
             sheet_lower = sheet_name.lower()
             if "management review" in sheet_lower and "1.0" in sheet_name:
                 management_sheet = sheet_name
@@ -1269,6 +1281,7 @@ class SOC1Agent:
         self,
         pdf_content: ExtractedPDFContent,
         template: ExcelTemplate,
+        target_sheets: list[str] | None = None,
     ) -> dict[str, list[dict[str, Any]]]:
         """
         Use AI to extract data from PDF and map to Excel template.
@@ -1276,12 +1289,13 @@ class SOC1Agent:
         Args:
             pdf_content: Extracted PDF content
             template: Excel template structure
+            target_sheets: Optional list of sheet name substrings to filter which sheets to process
 
         Returns:
             Dict mapping sheet names to lists of row updates
         """
         try:
-            prompt = self._create_extraction_prompt(pdf_content, template)
+            prompt = self._create_extraction_prompt(pdf_content, template, target_sheets)
             print(f"\n{'='*60}")
             print("AI EXTRACTION")
             print(f"{'='*60}")
@@ -1310,19 +1324,30 @@ class SOC1Agent:
             import traceback
             traceback.print_exc()
             print("Trying simplified extraction...")
-            return self._extract_simplified(pdf_content, template)
+            return self._extract_simplified(pdf_content, template, target_sheets)
 
     def _extract_simplified(
         self,
         pdf_content: ExtractedPDFContent,
         template: ExcelTemplate,
+        target_sheets: list[str] | None = None,
     ) -> dict[str, list[dict[str, Any]]]:
-        """Simplified extraction as fallback - extracts one sheet at a time."""
+        """Simplified extraction as fallback - extracts one sheet at a time.
+
+        Args:
+            pdf_content: Extracted PDF content
+            template: Excel template structure
+            target_sheets: Optional list of sheet name substrings to filter which sheets to process
+        """
         result = {}
-        
+
         for sheet_name in template.sheet_names:
+            # Skip if target_sheets is specified and this sheet doesn't match
+            if target_sheets and not any(target in sheet_name for target in target_sheets):
+                continue
+
             sheet_lower = sheet_name.lower()
-            
+
             # Only process relevant sheets
             if not any(x in sheet_lower for x in ["management review", "user entity", "cuec", "comp user"]):
                 continue
@@ -1550,12 +1575,15 @@ async def process_soc1_documents(
     log_memory("after PDF extraction")
 
     # Step 2: Read Excel template (read_only + ZIP parse, constant memory)
+    # Read ALL sheets, but will only process target tabs with AI
     print(f"Reading Excel template: {management_review_path}")
     _, template = ExcelHandler.read_template(
         management_review_path,
-        target_tabs=["1.0", "2.0.b"],
+        target_tabs=None,  # Read all sheets
     )
-    print(f"  - Kept sheets: {template.sheet_names}")
+    target_sheets = ["1.0", "2.0.b"]  # Only process these with AI
+    print(f"  - Total sheets: {template.sheet_names}")
+    print(f"  - Target sheets for AI processing: {[s for s in template.sheet_names if any(t in s for t in target_sheets)]}")
     for sheet, headers in template.headers.items():
         print(f"  - {sheet}: {len(headers)} columns")
     log_memory("after Excel template load")
@@ -1565,7 +1593,8 @@ async def process_soc1_documents(
     agent = SOC1Agent(api_key=api_key)
 
     print("Extracting and mapping content using AI...")
-    mappings = agent.extract_and_map(pdf_content, template)
+    # Only process target sheets with AI, leave others unchanged
+    mappings = agent.extract_and_map(pdf_content, template, target_sheets)
     log_memory("after AI extraction")
 
     # Step 4: Fill the template via xlsxwriter (streaming, constant memory)
