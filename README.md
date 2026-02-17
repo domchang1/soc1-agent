@@ -101,7 +101,7 @@ The Excel read/write pipeline is split into two libraries to stay well under a 2
 | **Parse layout & styles** | stdlib `zipfile` + `ElementTree.iterparse` | Streaming XML | ~5 MB |
 | **Write output** | xlsxwriter | Forward-only rows | ~10 MB |
 
-Only the target tabs (`1.0` and `2.0.b`) are kept in the output to minimize memory usage. All original formatting is preserved through streaming XML parsing:
+All original formatting is preserved through streaming XML parsing:
 - **Fonts** (family, size, bold, italic, color)
 - **Cell backgrounds** (colors and patterns)
 - **Borders** (all sides with correct styles)
@@ -154,62 +154,6 @@ Get your free Google API key at: https://aistudio.google.com/apikey
 4. Add environment variable in Settings:
    - `GOOGLE_API_KEY`: Your free API key from https://aistudio.google.com/apikey
 5. Deploy! Render will provide a URL like `https://your-app.onrender.com`
-
-**Note**: Render free tier spins down after 15 minutes of inactivity. Upgrade to paid tier for 24/7 availability.
-
-#### Memory Limits
-
-Render's free tier provides 2 GB RAM. The backend is heavily optimized to stay well within this limit through multiple memory-saving techniques:
-
-**Memory Optimizations:**
-- PDF extraction: 150 pages max (covers most SOC1 reports)
-- Table extraction: 40 tables max (comprehensive coverage)
-- Excel templates: Right-sized to 50 rows × 10 columns (actual data ~36×7)
-- Excel cell formats captured only for first 60 rows
-- Immediate cleanup of temporary data structures (text_parts, rows_by_idx)
-- Aggressive garbage collection after each processing phase
-- Streaming XML parsing for all Excel formatting data
-- Row-by-row Excel writing (never loads full workbook)
-- **99% reduction in Excel memory usage** (was reading 75,000 cells, now 500)
-
-**AI Quality Improvements:**
-- Temperature: 0.3 (balanced reasoning, was 0.1 conservative)
-- Context window: 200K chars (2.5x more PDF context)
-- Output tokens: 100K max (handles largest templates)
-- Shows ALL table rows, form fields, and headers in prompts
-- Enhanced prompts with extraction strategies and tips
-- 5 retries with smart backoff (was 3)
-- CUEC extraction: 60K char context (3x improvement)
-
-**Test locally with 2 GB constraint:**
-```bash
-docker build -t soc1-agent:latest .
-docker run --rm -it \
-  --memory=2g --memory-swap=2g \
-  -p 8000:8000 \
-  -e GOOGLE_API_KEY="your-key" \
-  -e ENABLE_MEM_LOG=1 \
-  soc1-agent:latest
-```
-
-Set `ENABLE_MEM_LOG=1` to log RSS memory every 0.5 s for debugging.
-
-**Expected Memory Usage (Fully Optimized):**
-- Start: ~50 MB (Python + libraries)
-- After PDF extraction: ~250 MB (150 pages, 40 tables)
-- After Excel template load: ~180 MB (50×10 cells, 99% reduction!)
-- Peak during AI extraction: ~580 MB (larger prompts/responses)
-- Peak during fill_template: ~480 MB
-- Final after cleanup: ~150 MB
-
-**Memory Budget:** ~580 MB peak (71% under 2 GB limit, 1.42 GB headroom!)
-
-**Key Optimizations:**
-- Excel reading: 75,000 cells → 500 cells (99% reduction)
-- Right-sized to actual data dimensions (36×7 → 50×10 with buffer)
-- Total Excel memory: ~70 MB → ~540 KB
-
-See `MEMORY_ANALYSIS.md`, `PERFORMANCE_IMPROVEMENTS.md`, and `MEMORY_OPTIMIZATION_FINAL.md` for detailed analysis.
 
 ### Frontend Deployment (Vercel)
 
