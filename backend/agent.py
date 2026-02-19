@@ -130,20 +130,134 @@ class PDFExtractor:
                         ]
                         tables.append(cleaned_table)
 
-        full_text = "\n\n--- Page Break ---\n\n".join(text_parts)
+        # Include page numbers in separators so we can navigate by page.
+        # Detect each page's printed document page number (from footer) so
+        # the AI can use the document's own numbering, not the PDF index.
+        page_segments = []
+        for idx, text in enumerate(text_parts):
+            doc_page = PDFExtractor._detect_doc_page_number(text)
+            if doc_page is not None:
+                page_segments.append(
+                    f"--- Page {idx + 1} (Document Page {doc_page}) ---\n{text}"
+                )
+            else:
+                page_segments.append(f"--- Page {idx + 1} ---\n{text}")
+        full_text = "\n\n".join(page_segments)
+        del page_segments
 
-        # MEMORY FIX: Delete text_parts immediately to avoid duplicate storage
+        # MEMORY FIX: Delete text_parts immediately
         del text_parts
         gc.collect()
 
-        # MEMORY FIX: Don't store individual pages, just return empty list
-        # This saves significant memory for large PDFs
         return ExtractedPDFContent(
             full_text=full_text,
             pages=[],  # Empty to save memory
             tables=tables,
             metadata=metadata,
         )
+
+    @staticmethod
+    def _detect_doc_page_number(page_text: str) -> int | None:
+        """Detect the document's own page number from footer/header text.
+
+        SOC1 reports typically print a page number at the bottom of each page.
+        This finds that number so we can use the document's own numbering
+        rather than the physical PDF page index.
+        """
+        lines = page_text.strip().split("\n")
+        if not lines:
+            return None
+
+        # Check the last 3 lines for a page number (footer area)
+        for line in reversed(lines[-3:]):
+            line = line.strip()
+            # Pattern: standalone number like "86"
+            if re.match(r"^\d{1,3}$", line):
+                return int(line)
+            # Pattern: "Page 86" or "Page 86 of 150" or "- 86 -"
+            m = re.search(r"[Pp]age\s+(\d{1,3})", line)
+            if m:
+                return int(m.group(1))
+            m = re.match(r"^[-–—]\s*(\d{1,3})\s*[-–—]$", line)
+            if m:
+                return int(m.group(1))
+
+        # Also check the first 2 lines (some docs put page numbers in headers)
+        for line in lines[:2]:
+            line = line.strip()
+            m = re.search(r"[Pp]age\s+(\d{1,3})", line)
+            if m:
+                return int(m.group(1))
+
+        return None
+
+    @staticmethod
+    def parse_toc(full_text: str) -> dict[str, int]:
+        """Parse the Table of Contents to extract section name -> page number mappings.
+
+        Looks for common TOC patterns like:
+            Section Name .............. 42
+            Section Name ... 42
+            Section Name  42
+        """
+        toc_mappings: dict[str, int] = {}
+
+        # Find the TOC region (first ~15K chars usually covers it)
+        text_lower = full_text[:15000].lower()
+        toc_start = -1
+        for marker in ["table of contents", "contents\n", "table of\ncontents"]:
+            pos = text_lower.find(marker)
+            if pos != -1:
+                toc_start = pos
+                break
+
+        if toc_start == -1:
+            return toc_mappings
+
+        # Extract TOC region (typically 2-5 pages)
+        toc_text = full_text[toc_start:toc_start + 8000]
+
+        # Match lines like: "Section Name .... 42" or "Section Name  42"
+        # Handles dots, spaces, and mixed separators between name and page number
+        toc_pattern = re.compile(
+            r"^(.{5,80}?)\s*[.\s·…]{2,}\s*(\d{1,3})\s*$",
+            re.MULTILINE,
+        )
+        for match in toc_pattern.finditer(toc_text):
+            section_name = match.group(1).strip()
+            page_num = int(match.group(2))
+            if page_num > 0:
+                toc_mappings[section_name] = page_num
+
+        return toc_mappings
+
+    @staticmethod
+    def extract_page_range(full_text: str, start_page: int, num_pages: int = 30) -> str:
+        """Extract text for a specific page range from the full text.
+
+        Args:
+            full_text: The full extracted text with '--- Page N ---' markers.
+            start_page: The starting page number (1-indexed).
+            num_pages: How many pages to extract (default 30).
+
+        Returns:
+            The extracted text for the specified page range.
+        """
+        # Find the start marker
+        start_marker = f"--- Page {start_page} ---"
+        start_pos = full_text.find(start_marker)
+        if start_pos == -1:
+            return ""
+
+        # Find the end marker
+        end_page = start_page + num_pages
+        end_marker = f"--- Page {end_page} ---"
+        end_pos = full_text.find(end_marker)
+        if end_pos == -1:
+            # Take everything from start to end
+            end_pos = len(full_text)
+
+        return full_text[start_pos:end_pos]
 
 
 class ExcelHandler:
@@ -763,6 +877,25 @@ class ExcelHandler:
                     format_cache[cache_key] = wb.add_format(props)
             return format_cache[cache_key]
 
+        # Pre-built table body formats for extending tables beyond template rows.
+        # Used when the template has no cell_fmts for the data rows (empty rows
+        # may have formatting via table styles that we can't parse from ZIP).
+        _table_body_fmts: dict[str | None, Any] = {}
+        def get_table_body_format(confidence: str | None = None) -> Any:
+            """Get a basic table body format with borders + text wrap."""
+            if confidence not in _table_body_fmts:
+                props: dict[str, Any] = {
+                    "border": 1,        # thin border on all sides
+                    "text_wrap": True,
+                    "valign": "top",
+                }
+                if confidence == "low":
+                    props["bg_color"] = "#FFCCCC"
+                elif confidence == "medium":
+                    props["bg_color"] = "#FFFFCC"
+                _table_body_fmts[confidence] = wb.add_format(props)
+            return _table_body_fmts[confidence]
+
         def normalize_confidence(c: Any) -> str:
             if c in ("h", "high"):
                 return "high"
@@ -843,6 +976,15 @@ class ExcelHandler:
                             max_r = max(max_r, row_idx)
                             max_c = max(max_c, col_idx)
 
+            # ── Set row heights for new AI rows beyond the template ──
+            orig_max_r_for_heights = template.max_row.get(sheet_name, 0)
+            if sheet_type == "table" and max_r > orig_max_r_for_heights:
+                # Use the first data row's height as the template for new rows
+                data_row_height = template.row_heights.get(sheet_name, {}).get(h_row + 1)
+                if data_row_height:
+                    for r in range(orig_max_r_for_heights + 1, max_r + 1):
+                        ws.set_row(r - 1, data_row_height)
+
             # ── Step B: Write merged ranges ──
             # AI data overrides existing values for any merge whose top-left
             # cell has an AI entry (e.g. form answer areas in the Mgmt Review).
@@ -885,8 +1027,33 @@ class ExcelHandler:
                 else:
                     ws.merge_range(fr - 1, fc - 1, lr - 1, lc - 1, val, fmt)
 
+            # ── Build fallback style for extending table formatting ──
+            # For table sheets, find the style IDs from the last formatted
+            # data row so new AI rows beyond the template inherit formatting.
+            orig_max_r = template.max_row.get(sheet_name, 0)
+            fallback_style: dict[int, int] = {}
+            if sheet_type == "table":
+                # Scan all cell_fmts entries after the header row to find
+                # the best style for each column (use the last data row's
+                # style since it represents the table body formatting).
+                for (r, c), fmt_dict in cell_fmts.items():
+                    sid = fmt_dict.get("styleId")
+                    if sid is not None and r > h_row:
+                        # Keep the style from the highest row for each column
+                        if c not in fallback_style:
+                            fallback_style[c] = sid
+                        else:
+                            # Prefer styles from later rows (closer to the end)
+                            fallback_style[c] = sid
+                print(f"  Fallback styles: {len(fallback_style)} columns from {len(cell_fmts)} format entries (h_row={h_row}, orig_max_r={orig_max_r})")
+
             # ── Step C: Write non-merged cells ──
+            # For new rows (beyond template), we need formatting. Strategy:
+            #   1. Use fallback_style from cell_fmts if available
+            #   2. Otherwise use a programmatic table body format (borders + wrap)
+            is_table = sheet_type == "table"
             for r in range(1, max_r + 1):
+                is_new_row = r > orig_max_r
                 for c in range(1, max_c + 1):
                     if (r, c) in merged_set:
                         continue  # Already handled by merge_range above
@@ -894,19 +1061,35 @@ class ExcelHandler:
                     # Get original cell style from template
                     orig_style_id = cell_fmts.get((r, c), {}).get("styleId")
 
+                    # For new rows, try fallback from template data rows
+                    if orig_style_id is None and is_new_row and c in fallback_style:
+                        orig_style_id = fallback_style[c]
+
                     # AI data takes priority over existing template data
                     if (r, c) in ai_cells:
                         val, conf = ai_cells[(r, c)]
-                        # AI data: apply confidence coloring (overrides original bg)
                         conf_override = conf if conf != "high" else None
-                        fmt = get_format(orig_style_id, conf_override)
+                        if orig_style_id is not None:
+                            fmt = get_format(orig_style_id, conf_override)
+                        elif is_new_row and is_table:
+                            # No template style at all: use programmatic format
+                            fmt = get_table_body_format(conf_override)
+                        else:
+                            fmt = get_format(None, conf_override)
                         ws.write(r - 1, c - 1, val, fmt)
                         cells_written_total += 1
                     elif (r, c) in existing:
-                        # No AI data: use original template value and style
                         val = existing[(r, c)]
                         fmt = get_format(orig_style_id)
                         ws.write(r - 1, c - 1, val, fmt)
+                    elif is_new_row and is_table:
+                        # New row beyond template: write empty cell with
+                        # table formatting so borders extend across all columns
+                        if orig_style_id is not None:
+                            fmt = get_format(orig_style_id)
+                        else:
+                            fmt = get_table_body_format()
+                        ws.write(r - 1, c - 1, "", fmt)
 
             print(f"  Sheet '{sheet_name}': wrote {cells_written_total} AI cells")
 
@@ -976,6 +1159,51 @@ class SOC1Agent:
         self.client = genai.Client(api_key=self.api_key)
         # Use Gemini 2.5 Flash for free tier (latest, fast and capable)
         self.model = "gemini-2.5-flash"
+
+    def _find_cuec_section(self, pdf_content: ExtractedPDFContent) -> str:
+        """Find and return the CUEC section text using TOC parsing + keyword fallback.
+
+        Returns the extracted section text, or empty string if not found.
+        """
+        # Strategy 1: Use Table of Contents for precise page navigation
+        toc = PDFExtractor.parse_toc(pdf_content.full_text)
+        if toc:
+            for section_name, page_num in toc.items():
+                if any(kw in section_name.lower() for kw in [
+                    "complementary user entity",
+                    "complementary user-entity",
+                    "user entity control",
+                    "cuec",
+                    "user entity responsibilities",
+                    "user organization control",
+                ]):
+                    section_text = PDFExtractor.extract_page_range(
+                        pdf_content.full_text, page_num, num_pages=30
+                    )
+                    if section_text:
+                        print(f"  CUEC section found via TOC: '{section_name}' page {page_num} ({len(section_text)} chars)")
+                        return section_text
+
+        # Strategy 2: Keyword search in full text
+        full_text_lower = pdf_content.full_text.lower()
+        cuec_keywords = [
+            "complementary user entity control",
+            "complementary user-entity control",
+            "user entity responsibilities",
+            "user organization controls",
+            "complementary controls",
+            "cuec",
+        ]
+        for kw in cuec_keywords:
+            pos = full_text_lower.rfind(kw)
+            if pos != -1:
+                start = max(0, pos - 10000)
+                end = min(len(pdf_content.full_text), pos + 50000)
+                print(f"  CUEC section found via keyword '{kw}' at position {pos}")
+                return pdf_content.full_text[start:end]
+
+        print("  WARNING: CUEC section not found by TOC or keyword search")
+        return ""
 
     def _generate(self,
         prompt: str,
@@ -1219,18 +1447,36 @@ class SOC1Agent:
                 label = field['label'][:100]  # Show more of label (was 80 chars)
                 prompt_parts.append(f"  - Row {field['row']}: \"{label}\"")
         
-        # Handle CUEC sheet (table-style)
+        # Handle CUEC sheet (table-style) - only fill first 4 columns
         if cuec_sheet and template.sheet_type.get(cuec_sheet) == "table":
-            cuec_headers = template.headers.get(cuec_sheet, [])
+            all_cuec_headers = template.headers.get(cuec_sheet, [])
+            cuec_headers = all_cuec_headers[:4]  # Only first 4 columns
             prompt_parts.append(f"\n### Sheet: {cuec_sheet} (TABLE)")
             prompt_parts.append(f"Header row: {template.header_row.get(cuec_sheet)}")
-            prompt_parts.append("Column headers (USE THESE EXACT NAMES):")
-            # PERFORMANCE: Show ALL headers (was limited to 10)
+            prompt_parts.append(f"Fill ONLY these {len(cuec_headers)} columns (USE THESE EXACT NAMES):")
             for i, h in enumerate(cuec_headers, 1):
                 prompt_parts.append(f"  {i}. \"{h}\"")
-            prompt_parts.append("\nLook for 'Complementary User Entity Controls' section in the PDF.")
-            prompt_parts.append("Extract ALL CUECs - they are often in tables or numbered lists near the end of the document.")
-            prompt_parts.append("CUECs may also be called 'User Entity Responsibilities' or 'Subservice Organization Controls'.")
+
+            # Find and include the targeted CUEC section so the AI doesn't miss it
+            cuec_targeted = self._find_cuec_section(pdf_content)
+            if cuec_targeted:
+                prompt_parts.append(f"\n### CUEC SECTION (extracted from PDF for reference):\n{cuec_targeted}")
+
+            # Detect which header is the page column
+            page_col = None
+            for h in cuec_headers:
+                if "page" in h.lower() or "ref" in h.lower():
+                    page_col = h
+                    break
+            if page_col:
+                prompt_parts.append(f"\nPAGE NUMBERS: For the \"{page_col}\" column, use the 'Document Page' number from the page markers (e.g., '--- Page 88 (Document Page 86) ---' means use '86'). This is the page number printed on the PDF page itself, not the PDF index. Each CUEC may be on a different page - provide the correct page for EACH CUEC individually.")
+
+            prompt_parts.append("\nExtract ALL CUECs from the section above (or elsewhere in the PDF). They appear in various formats:")
+            prompt_parts.append("- A table with numbered rows")
+            prompt_parts.append("- A numbered or bulleted list")
+            prompt_parts.append("- Bullet points organized under category headings (e.g., 'Security Organization', 'Logical Access', 'Change Management')")
+            prompt_parts.append("  In this case, each bullet is one CUEC and the category heading maps to the Control Objective.")
+            prompt_parts.append("CUECs may also be called 'User Entity Responsibilities', 'Subservice Organization Controls', or 'Complementary Controls'.")
 
         # Handle Deviations sheet
         if deviations_sheet and template.sheet_type.get(deviations_sheet) == "table":
@@ -1255,14 +1501,34 @@ class SOC1Agent:
             prompt_parts.append("  ],")
         
         if cuec_sheet:
-            cuec_h = template.headers.get(cuec_sheet, ["No.", "Description"])
-            h1 = cuec_h[0] if len(cuec_h) > 0 else "No."
-            h2 = cuec_h[2] if len(cuec_h) > 2 else "Description"
-            h3 = cuec_h[3] if len(cuec_h) > 3 else "Control Objective"
+            cuec_h = template.headers.get(cuec_sheet, ["No.", "Description"])[:4]  # First 4 only
             start_row = template.header_row.get(cuec_sheet, 1) + 1
+            # Build example row with first 4 columns only
+            example_row_1 = {'"_row"': str(start_row)}
+            example_row_2 = {'"_row"': str(start_row + 1)}
+            for ci, col_name in enumerate(cuec_h):
+                col_lower = col_name.lower()
+                key = f'"{col_name}"'
+                if ci == 0 or "no" in col_lower:
+                    example_row_1[key] = '"1"'
+                    example_row_2[key] = '"2"'
+                elif "page" in col_lower or "ref" in col_lower:
+                    example_row_1[key] = '"86"'
+                    example_row_2[key] = '"87"'
+                elif "description" in col_lower or ("control" in col_lower and "objective" not in col_lower):
+                    example_row_1[key] = '"User entities are responsible for..."'
+                    example_row_2[key] = '"Another CUEC..."'
+                elif "objective" in col_lower:
+                    example_row_1[key] = '"CO 2 - Logical access"'
+                    example_row_2[key] = '"CO 2 - Logical access"'
+                else:
+                    example_row_1[key] = f'"value for {col_name}"'
+                    example_row_2[key] = f'"value for {col_name}"'
+            row1_str = ", ".join(f"{k}: {v}" for k, v in example_row_1.items())
+            row2_str = ", ".join(f"{k}: {v}" for k, v in example_row_2.items())
             prompt_parts.append(f'  "{cuec_sheet}": [')
-            prompt_parts.append(f'    {{"_row": {start_row}, "{h1}": "1", "{h2}": "User entities are responsible for...", "{h3}": "CO 2 - Logical access"}},')
-            prompt_parts.append(f'    {{"_row": {start_row + 1}, "{h1}": "2", "{h2}": "Another CUEC...", "{h3}": "CO 2 - Logical access"}}')
+            prompt_parts.append(f'    {{{row1_str}}},')
+            prompt_parts.append(f'    {{{row2_str}}}')
             prompt_parts.append("  ]")
         
         prompt_parts.append("}")
@@ -1360,23 +1626,50 @@ class SOC1Agent:
             print(f"  Sheet type: {sheet_type}, Headers: {headers[:5]}")
             
             if "user entity" in sheet_lower or "cuec" in sheet_lower or "comp user" in sheet_lower:
-                # Special handling for CUEC sheet - look specifically for the CUEC section
-                # Look for CUEC section in the text
-                cuec_section = ""
-                full_text_lower = pdf_content.full_text.lower()
-                cuec_start = full_text_lower.find("complementary user entity control")
-                if cuec_start == -1:
-                    cuec_start = full_text_lower.find("cuec")
-
-                if cuec_start != -1:
-                    # PERFORMANCE: Extract 60K chars around CUEC section (was 20K)
-                    start = max(0, cuec_start - 10000)
-                    end = min(len(pdf_content.full_text), cuec_start + 50000)
-                    cuec_section = pdf_content.full_text[start:end]
-                else:
-                    # PERFORMANCE: Use last 60K chars (was 20K) - CUECs often at end
+                # Special handling for CUEC sheet - find the CUEC section
+                cuec_section = self._find_cuec_section(pdf_content)
+                if not cuec_section:
+                    # Last resort: use last 60K chars
                     cuec_section = pdf_content.full_text[-60000:]
                 
+                # Only fill first 4 columns of CUEC sheet
+                cuec_headers = headers[:4]
+
+                # Detect page column and build dynamic examples using first 4 headers
+                page_col = None
+                for h in cuec_headers:
+                    if "page" in h.lower() or "ref" in h.lower():
+                        page_col = h
+                        break
+
+                # Build example JSON rows with first 4 columns only
+                ex_parts_1 = [f'"_row": {header_row + 1}']
+                ex_parts_2 = [f'"_row": {header_row + 2}']
+                for ci, col_name in enumerate(cuec_headers):
+                    cl = col_name.lower()
+                    if ci == 0 or "no" in cl:
+                        ex_parts_1.append(f'"{col_name}": "1"')
+                        ex_parts_2.append(f'"{col_name}": "2"')
+                    elif "page" in cl or "ref" in cl:
+                        ex_parts_1.append(f'"{col_name}": "86"')
+                        ex_parts_2.append(f'"{col_name}": "87"')
+                    elif "description" in cl or ("control" in cl and "objective" not in cl):
+                        ex_parts_1.append(f'"{col_name}": "User entities are responsible for..."')
+                        ex_parts_2.append(f'"{col_name}": "Customers should maintain policies..."')
+                    elif "objective" in cl:
+                        ex_parts_1.append(f'"{col_name}": "CO 2 - Logical access"')
+                        ex_parts_2.append(f'"{col_name}": "Security Organization"')
+                    else:
+                        ex_parts_1.append(f'"{col_name}": "value"')
+                        ex_parts_2.append(f'"{col_name}": "value"')
+                example_1 = "{" + ", ".join(ex_parts_1) + "}"
+                example_2 = "{" + ", ".join(ex_parts_2) + "}"
+
+                page_instruction = ""
+                if page_col:
+                    page_instruction = f"""
+PAGE NUMBERS: For the "{page_col}" column, use the 'Document Page' number from the page markers (e.g., '--- Page 88 (Document Page 86) ---' means use '86'). This is the page number printed on the PDF page itself, not the PDF index. Each CUEC may be on a different page - provide the correct page for EACH CUEC individually."""
+
                 prompt = f"""Extract ALL Complementary User Entity Controls (CUECs) from this SOC1 Type II report.
 
 CUECs describe responsibilities that the user organization must perform. They may be called:
@@ -1386,26 +1679,32 @@ CUECs describe responsibilities that the user organization must perform. They ma
 - "Complementary Controls"
 - "User Organization Controls"
 
-Common patterns:
-- Usually in a dedicated section near the end of the report
-- Often in a table or numbered list format
-- Each CUEC has: a number/ID, description, and related control objective
-- There are typically 5-20 CUECs in a report
+Common patterns - CUECs appear in TWO main formats:
 
+FORMAT A (Table/List): CUECs in a numbered table or list, each with an explicit number, description, and control objective reference.
+
+FORMAT B (Section with bullets): A section heading like "Complementary User Entity Controls", followed by category sub-headings (e.g., "Security Organization", "Logical Access"). Under each category, bullet points describe the CUECs. Each bullet is one CUEC. The category heading serves as the Control Objective.
+
+In BOTH formats:
+- There are typically 5-30 CUECs in a report
+- Assign sequential numbers (1, 2, 3...) if the CUECs are not already numbered
+- For bullet-format CUECs, use the category heading as the Control Objective value
+{page_instruction}
 PDF Content (CUEC section + context):
 {cuec_section}
 
-Excel columns to fill (USE THESE EXACT NAMES):
-{chr(10).join(f'  - "{h}"' for h in headers)}
+Fill ONLY these {len(cuec_headers)} columns (USE THESE EXACT NAMES):
+{chr(10).join(f'  - "{h}"' for h in cuec_headers)}
 
 The header row is {header_row}, so data starts at row {header_row + 1}.
 
-IMPORTANT: Extract ALL CUECs you find. Read carefully through tables and lists.
+IMPORTANT: Extract ALL CUECs you find. Read carefully through tables, lists, AND bulleted sections.
+Fill ONLY the {len(cuec_headers)} columns listed above for each CUEC row.
 
 Return JSON array with one object per CUEC found:
 [
-  {{"_row": {header_row + 1}, "No.": "1", "{headers[2] if len(headers) > 2 else 'Description'}": "User entities are responsible for...", "{headers[3] if len(headers) > 3 else 'Control Objective'}": "CO 2 - Logical access"}},
-  {{"_row": {header_row + 2}, "No.": "2", "{headers[2] if len(headers) > 2 else 'Description'}": "Another control...", "{headers[3] if len(headers) > 3 else 'Control Objective'}": "CO 2 - Logical access"}}
+  {example_1},
+  {example_2}
 ]
 
 Return ONLY valid JSON array. No markdown, no commentary."""
@@ -1570,8 +1869,17 @@ async def process_soc1_documents(
     # Step 1: Extract PDF content
     print(f"Extracting content from PDF: {type_ii_path}")
     pdf_content = PDFExtractor.extract(type_ii_path)
-    print(f"  - Extracted {len(pdf_content.pages)} pages")
+    print(f"  - Full text length: {len(pdf_content.full_text)} chars")
     print(f"  - Found {len(pdf_content.tables)} tables")
+
+    # Parse TOC for diagnostics
+    toc = PDFExtractor.parse_toc(pdf_content.full_text)
+    if toc:
+        print(f"  - TOC parsed: {len(toc)} entries")
+        for name, page in list(toc.items())[:10]:
+            print(f"    {name} -> page {page}")
+    else:
+        print("  - No TOC found in PDF")
     log_memory("after PDF extraction")
 
     # Step 2: Read Excel template (read_only + ZIP parse, constant memory)
@@ -1595,6 +1903,14 @@ async def process_soc1_documents(
     print("Extracting and mapping content using AI...")
     # Only process target sheets with AI, leave others unchanged
     mappings = agent.extract_and_map(pdf_content, template, target_sheets)
+
+    # Check if CUECs were found
+    for sheet_name, rows in mappings.items():
+        if any(kw in sheet_name.lower() for kw in ["user entity", "cuec", "comp user"]):
+            if not rows:
+                print(f"  WARNING: CUEC sheet '{sheet_name}' has 0 rows - extraction may have failed")
+            else:
+                print(f"  CUEC sheet '{sheet_name}': {len(rows)} CUECs extracted")
     log_memory("after AI extraction")
 
     # Step 4: Fill the template via xlsxwriter (streaming, constant memory)
